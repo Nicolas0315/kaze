@@ -214,7 +214,9 @@ def load_model(path: str, kind: str = "int8", group: int = 128, device: str = "c
     if p + "lm_head.weight" in keys:
         lm = _q(reader.get(p + "lm_head.weight"), None, lm_kind, group, dev)
     else:
-        lm = QuantLinear.from_float(embed.float(), None, kind=lm_kind, group=group)
+        # from_float quantises row by row, so hand it the fp16 table directly:
+        # embed.float() used to materialise a full fp32 copy (+0.5 GB on a 152k vocab)
+        lm = QuantLinear.from_float(embed, None, kind=lm_kind, group=group)
     model = KazeModel(cfg, embed, layers, final_norm, lm, dev, dtype=dtype)
     if verbose:
         print(f"  weights: {model.weight_bytes() / 1e6:.1f} MB", flush=True)

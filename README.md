@@ -17,16 +17,17 @@ qk-norm に対応しています）。重みは safetensors と旧形式の .bin
 
 ## 速度
 
-RTX 3070（8 GB）での実測です。量子化は int4（lm_head は int8）、greedy、プロンプトは 48 トークン。
+RTX 3070（8 GB）での実測です。量子化は int4（lm_head も int4）、greedy、プロンプトは 48 トークン、
+128 トークン生成。`python3 bench/verify.py` と同じ条件で測っています。
 
 | モデル | decode | prefill |
 |---|---|---|
-| Qwen2.5-0.5B | 636 tok/s | 40,000 tok/s |
-| Qwen2.5-1.5B | 273 tok/s | 13,700 tok/s |
-| Qwen2.5-3B | 167 tok/s | 7,550 tok/s |
-| Qwen2.5-7B | 64 tok/s | 3,180 tok/s |
+| Qwen2.5-0.5B | 622 tok/s | 38,955 tok/s |
+| Qwen2.5-1.5B | 261 tok/s | 14,425 tok/s |
+| Qwen2.5-3B | 165 tok/s | 7,527 tok/s |
+| Qwen2.5-7B | 64 tok/s | 3,725 tok/s |
 
-5 回測った中央値で、ばらつきは 0.2% 程度です。decode は 1 トークンあたりの重み読み出しがそのまま
+同じ条件で 5 回測った中央値で、2 回目以降のばらつきは 0.2% 程度です（実行をまたぐと ±2% ほど動きます）。decode は 1 トークンあたりの重み読み出しがそのまま
 速度になるので、量子化のビット数を下げるほど速くなります。同時に複数のリクエストを流しても
 重みの読み出しは 1 回で済むため、1 本あたりの速度はほとんど落ちません。
 
@@ -67,8 +68,16 @@ from kaze.llm import LLM
 llm = LLM("Qwen/Qwen2.5-0.5B-Instruct", kind="int4", lm_head_kind="int8")
 for text, done in llm.stream_text("Write a haiku about GPUs.", max_tokens=48):
     print(text, end="", flush=True)
+
+# まとめて受け取る場合はこちら。max_tokens や temperature は引数でも、SamplingParams でも渡せます
+result = llm.generate("2 + 2 =", max_tokens=16, temperature=0.0)
+print(result.text)
+
 llm.shutdown()
 ```
+
+品質を優先するときは `--lm-head-kind int8` を付けてください。int4 の lm_head を int8 にすると、
+KL が 0.093 から 0.069 に下がります（decode は 9% 遅くなります）。
 
 8 GB のカードで 7B を動かす場合は `--cache-dtype fp8v` を付けてください。KV の K は fp16 のまま、
 V だけ fp8 にすることでメモリを 25% 減らせます。

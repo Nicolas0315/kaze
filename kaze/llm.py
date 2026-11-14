@@ -66,13 +66,38 @@ class LLM:
         self._prof = {"step_s": 0.0, "dispatch_s": 0.0, "steps": 0}
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        # ループが例外で死ぬと、待っているリクエストが永久に返らない。原因を保持して
+        # 呼び出し側に例外として返す。
+        self._fatal: BaseException | None = None
         if start_loop:
             self._thread = threading.Thread(target=self._loop, daemon=True)
             self._thread.start()
 
     # ---------------------------------------------------------------- thread
+    def _raise_if_dead(self) -> None:
+        if self._fatal is not None:
+            raise RuntimeError(f"engine loop stopped: {self._fatal!r}") from self._fatal
+        if self._thread is None:
+            raise RuntimeError(
+                "no background loop (passed start_loop=False); drive engine.step() yourself")
+        if not self._thread.is_alive():
+            raise RuntimeError("engine loop is not running")
+
     def _loop(self) -> None:
         p = self._prof
+        try:
+            self._loop_body(p)
+        except BaseException as exc:      # noqa: BLE001 - 死んだら全リクエストを起こす
+            self._fatal = exc
+            with self._lock:
+                for st in self._results.values():
+                    st["reason"] = "error"
+                    st["done"].set()
+                for q in self._streams.values():
+                    q.put(exc)
+            raise
+
+    def _loop_body(self, p: dict) -> None:
         while not self._stop.is_set():
             if self.engine.is_idle():
                 time.sleep(0.002)
@@ -121,18 +146,35 @@ class LLM:
             self._streams[seq.request_id] = q
         return q
 
+    @staticmethod
+    def _sampling_params(params: SamplingParams | None, overrides: dict) -> SamplingParams:
+        """params= と max_tokens= のような個別指定の両方を受け付ける。"""
+        if not overrides:
+            return params or SamplingParams()
+        base = params.clone() if params is not None else SamplingParams()
+        for key, value in overrides.items():
+            if not hasattr(base, key):
+                raise TypeError(f"unknown sampling argument: {key}")
+            setattr(base, key, value)
+        return base
+
     def generate(self, prompt: str | list[int], params: SamplingParams | None = None,
-                 chat: bool = False) -> GenResult:
-        params = params or SamplingParams()
+                 chat: bool = False, **sampling) -> GenResult:
+        params = self._sampling_params(params, sampling)
         ids = self._encode(prompt, chat)
         seq = self.engine.add_request(ids, params)
         st = {"tokens": [], "ttft": None, "tpot": None, "reason": None,
               "done": threading.Event()}
         with self._lock:
             self._results[seq.request_id] = st
-        st["done"].wait()
+        while not st["done"].wait(0.05):
+            self._raise_if_dead()
         with self._lock:
             self._results.pop(seq.request_id, None)
+        if st["reason"] == "error":
+            # ループが死んだときは done を立てて起こすので、ここで必ず例外にする
+            self._raise_if_dead()
+            raise RuntimeError("request failed (engine loop stopped)")
         tokens = st["tokens"]
         text = self.tokenizer.decode(tokens, skip_special_tokens=True)
         return GenResult(text=text, tokens=tokens, ttft_ms=st["ttft"], tpot_ms=st["tpot"],
@@ -168,14 +210,20 @@ class LLM:
         return list(self.tokenizer(prompt, return_tensors=None)["input_ids"])
 
     def stream_text(self, prompt, params: SamplingParams | None = None,
-                    chat: bool = False) -> Iterator[tuple[str, bool]]:
-        params = params or SamplingParams()
+                    chat: bool = False, **sampling) -> Iterator[tuple[str, bool]]:
+        params = self._sampling_params(params, sampling)
         ids = self._encode(prompt, chat)
         q = self.stream(ids, params)
         tokens: list[int] = []
         sent = 0
         while True:
-            out: RequestOutput = q.get()
+            try:
+                out: RequestOutput = q.get(timeout=0.2)
+            except queue.Empty:
+                self._raise_if_dead()
+                continue
+            if isinstance(out, BaseException):
+                raise RuntimeError(f"engine loop stopped: {out!r}") from out
             if out.tokens:
                 tokens.extend(out.tokens)
                 text = self.tokenizer.decode(tokens, skip_special_tokens=True)
