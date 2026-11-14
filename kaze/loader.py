@@ -111,9 +111,26 @@ def _q(t: torch.Tensor, bias: torch.Tensor | None, kind: str, group: int, device
                                   kind=kind, group=group)
 
 
+def _resolve_model_path(path: str) -> str:
+    """Accept a Hugging Face repo id as well as a local directory.
+
+    ("Qwen/Qwen2.5-0.5B-Instruct" is downloaded into the HF cache on first use.)
+    """
+    if os.path.isdir(path):
+        return path
+    if path.count("/") == 1 and not os.path.exists(path):
+        try:
+            from huggingface_hub import snapshot_download
+            return snapshot_download(repo_id=path)
+        except Exception:
+            return path
+    return path
+
+
 def load_model(path: str, kind: str = "int8", group: int = 128, device: str = "cuda",
                dtype: torch.dtype = torch.float16, lm_head_kind: str | None = None,
                verbose: bool = True) -> KazeModel:
+    path = _resolve_model_path(path)
     cfg = ModelConfig.from_pretrained(path)
     dev = torch.device(device)
     reader = _Reader(path)
