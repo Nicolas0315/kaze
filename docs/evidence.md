@@ -146,3 +146,18 @@ smoke テストは、あるとき int4 と量子化グループ幅 64 の組み�
 
 いずれも「形は正しいが値が違う」種類の壊れ方でした。数値の一致検査を層ごとに置くことが一番効きました。
 
+
+## 7. 未対応のモデル（Qwen3.8 系）
+
+Qwen3.8 系（Qwen/Qwen3.8-27B とその派生）は、現状のままでは動きません。理由は 3 つあります。
+
+1. 構成が linear attention と full attention の混在です。config の layer_types が 3 層ごとに
+   full_attention、残りが linear_attention になっており、このエンジンは full attention だけを
+   実装しています。
+2. 公開されている Qwen3.8-27B は画像入力を持つマルチモーダル（Qwen3_5ForConditionalGeneration）で、
+   テキストだけの経路は実装していません。
+3. 27B を int4 にしても約 13.5 GB 必要で、8 GB のカードには載りません。
+
+dense な自己回帰モデルであれば、量子化して VRAM に収まるサイズなら動きます（Qwen2.5 系、Qwen3 の
+0.6B などで確認済み）。
+
