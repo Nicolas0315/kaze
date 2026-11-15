@@ -250,6 +250,16 @@ def check_server() -> bool:
                              "max_tokens": 3, "stream": True}) as s:
         lines = [ln for ln in s.iter_lines() if ln]
     ok = ok and lines[-1] == "data: [DONE]"
+    # 並行リクエストと入力検証
+    import concurrent.futures as cf
+
+    body = {"messages": [{"role": "user", "content": "abc"}], "max_tokens": 4}
+    with cf.ThreadPoolExecutor(4) as ex:
+        rs = list(ex.map(lambda _: client.post("/v1/chat/completions", json=body), range(4)))
+    ok = ok and all(r.status_code == 200 for r in rs)
+    too_many = client.post("/v1/chat/completions",
+                           json={**body, "max_tokens": 999999})
+    ok = ok and too_many.status_code == 422
     print("server: health/chat/completion/stream ok=%s" % ok)
     return ok
 

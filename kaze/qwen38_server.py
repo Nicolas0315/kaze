@@ -47,6 +47,18 @@ def _render(tok, messages: list[dict], thinking: bool = False) -> str:
                                        add_generation_prompt=True)
 
 
+def _guard(fn) -> Any:
+    # 入力に起因する失敗は 400 で返す（CUDA を壊してから落ちるのを避ける）
+    from fastapi import HTTPException
+
+    try:
+        return fn()
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=f"engine error: {exc}") from exc
+
+
 def create_app(model, tok, model_name: str = "qwen3.8", graph: bool = False,
                max_len: int = 4096) -> FastAPI:
     import threading
@@ -70,13 +82,13 @@ def create_app(model, tok, model_name: str = "qwen3.8", graph: bool = False,
     @app.post("/v1/chat/completions")
     async def chat(req: ChatRequest) -> Any:
         text = _render(tok, [m.model_dump() for m in req.messages])
-        return _respond(req, text, tok, model, eos, graph, max_len, chat=True,
-                        decoder=decoder, lock=lock)
+        return _guard(lambda: _respond(req, text, tok, model, eos, graph, max_len, chat=True,
+                        decoder=decoder, lock=lock))
 
     @app.post("/v1/completions")
     async def completions(req: CompletionRequest) -> Any:
-        return _respond(req, req.prompt, tok, model, eos, graph, max_len, chat=False,
-                        decoder=decoder, lock=lock)
+        return _guard(lambda: _respond(req, req.prompt, tok, model, eos, graph, max_len, chat=False,
+                        decoder=decoder, lock=lock))
 
     return app
 
