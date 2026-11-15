@@ -45,6 +45,11 @@ def main() -> int:
     print(f"smoke (量子化の組み合わせ)  {line[-1] if line else 'FAILED'}")
     if rc != 0:
         bad.append("smoke")
+    rc, out = run([sys.executable, "tests/test_qwen38.py"])
+    line = [l for l in out.splitlines() if l.strip() in ("ok", "FAIL")]
+    print(f"qwen3.8 (Qwen3_5)          {line[-1] if line else "FAILED"}")
+    if rc != 0:
+        bad.append("qwen3.8")
     rc, out = run([sys.executable, "tests/test_llm.py"])
     line = [l for l in out.splitlines() if "passed" in l]
     print(f"llm (Python API)           {line[-1] if line else 'FAILED'}")

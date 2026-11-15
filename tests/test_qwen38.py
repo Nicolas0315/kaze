@@ -61,6 +61,34 @@ def check_load_and_generate() -> bool:
     return cos > 0.999 and len(out) == 4
 
 
+
+
+def check_cache() -> bool:
+    """キャッシュ経路が再計算経路と同じ logits・同じ生成結果になるか。"""
+    from transformers import AutoModelForCausalLM, Qwen3_5TextConfig
+
+    from kaze.qwen38 import generate
+
+    raw = dict(BASE, layer_types=LAYER_TYPES)
+    torch.manual_seed(0)
+    ref = AutoModelForCausalLM.from_config(Qwen3_5TextConfig(**raw),
+                                          dtype=torch.float32).eval()
+    sd = {k: v.detach().float() for k, v in ref.state_dict().items()}
+    model = Qwen38Model(Qwen38Config(raw), sd, dtype=torch.float32, device="cpu")
+    ids = [5, 12, 33, 7, 91]
+    cache = model.new_cache()
+    a = model(torch.tensor(ids), cache, 0)[0]
+    b = model(torch.tensor(ids))[0]
+    tok = int(a.argmax())
+    c = model(torch.tensor([tok]), cache, cache.len)[0]
+    d = model(torch.tensor(ids + [tok]))[0]
+    diff = (c - d).abs().max().item()
+    same_tokens = generate(model, ids, max_tokens=8, use_cache=True) == \
+        generate(model, ids, max_tokens=8, use_cache=False)
+    print("cache: 1ステップ差 %.7f  生成一致 %s" % (diff, same_tokens))
+    return diff < 1e-4 and same_tokens
+
+
 def main() -> int:
     try:
         from transformers import AutoModelForCausalLM, Qwen3_5TextConfig
@@ -86,7 +114,7 @@ def main() -> int:
     cos = torch.nn.functional.cosine_similarity(want, got, dim=0).item()
     diff = (want - got).abs().max().item()
     print("hybrid 4層（線形2 + full2）: cos %.6f  maxdiff %.6f" % (cos, diff))
-    ok = cos > 0.999 and check_load_and_generate()
+    ok = cos > 0.999 and check_load_and_generate() and check_cache()
     print("ok" if ok else "FAIL")
     return 0 if ok else 1
 

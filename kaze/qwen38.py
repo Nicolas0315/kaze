@@ -1,10 +1,8 @@
 """Qwen3.8（Qwen3_5 text）の実装。
 
-このアーキテクチャは full attention と gated delta net（線形注意）が交互に並ぶ hybrid 構成で、
-attention 側には出力ゲートと部分 RoPE が付きます。ここでは**正しさ優先**で書いていて、
-線形注意の再帰はトークンごとに素直に回します（速くはないが、参照実装と同じ計算）。
-
-履歴を持たないので decode でも毎回プロンプト全体を計算し直します。
+full attention と gated delta net（線形注意）が交互に並ぶ hybrid 構成で、attention 側には
+出力ゲートと部分 RoPE が付きます。KV キャッシュ（full attention）と再帰状態・conv 履歴
+（線形注意）を持つので、decode は 1 トークンあたり一定のコストで進みます。
 """
 from __future__ import annotations
 
@@ -27,8 +25,7 @@ def rope_tables(positions: torch.Tensor, dim: int, theta: float, dtype):
     return cos, sin
 
 
-def rms_norm(x: torch.Tensor, w: torch.Tensor, eps: float,
-             plus_one: bool = True) -> torch.Tensor:
+def rms_norm(x: torch.Tensor, w: torch.Tensor, eps: float, plus_one: bool = True) -> torch.Tensor:
     """Qwen3_5 の RMSNorm は重みを (1 + w) として掛ける（初期値はゼロ）。"""
     v = x.float().pow(2).mean(-1, keepdim=True)
     y = x.float() * torch.rsqrt(v + eps)
@@ -36,10 +33,29 @@ def rms_norm(x: torch.Tensor, w: torch.Tensor, eps: float,
     return y.to(x.dtype)
 
 
+def recurrent_delta_rule(q, k, v, g, beta, initial_state=None, return_state: bool = False):
+    b, t, h, dk = k.shape
+    dv = v.shape[-1]
+    q = F.normalize(q.float(), dim=-1, eps=1e-6) / (dk ** 0.5)
+    k = F.normalize(k.float(), dim=-1, eps=1e-6)
+    v = v.float()
+    if initial_state is None:
+        state = torch.zeros((b, h, dk, dv), dtype=torch.float32, device=q.device)
+    else:
+        state = initial_state.float()
+    out = torch.zeros((b, t, h, dv), dtype=torch.float32, device=q.device)
+    for i in range(t):
+        state = state * g[:, i].exp()[..., None, None]
+        kv_mem = (state * k[:, i][..., None]).sum(-2)
+        delta = (v[:, i] - kv_mem) * beta[:, i][..., None]
+        state = state + k[:, i][..., None] * delta[..., None, :]
+        out[:, i] = (state * q[:, i][..., None]).sum(-2)
+    return (out, state) if return_state else out
+
+
 def _reference_chunk_rule():
     # transformers に入っている chunked 実装（無ければ None）。
-    # 自前の chunked 版はまだ数値が合っていないので、使える環境では検証済みの実装に任せる。
-    # 見つからなければ逐次版（遅いが正しい）で動く。
+    # 自前の chunked 版は数値が合わなかったので、使える環境では検証済みの実装に任せる。
     for mod in ("transformers.models.qwen3_next.modeling_qwen3_next",
                 "transformers.models.qwen3_5.modeling_qwen3_5"):
         try:
@@ -55,30 +71,29 @@ def _reference_chunk_rule():
 _CHUNK_RULE = _reference_chunk_rule()
 
 
-def delta_rule(q, k, v, g, beta, chunk_size: int = 64):
-    # 使える実装のうち一番速いもので回す
+def delta_rule(q, k, v, g, beta, chunk_size: int = 64, initial_state=None,
+               return_state: bool = False):
     if _CHUNK_RULE is not None:
-        out, _ = _CHUNK_RULE(q, k, v, g, beta, chunk_size=chunk_size,
-                             use_qk_l2norm_in_kernel=True)
-        return out
-    return recurrent_delta_rule(q, k, v, g, beta)
+        out, st = _CHUNK_RULE(q, k, v, g, beta, chunk_size=chunk_size,
+                              initial_state=initial_state,
+                              output_final_state=return_state,
+                              use_qk_l2norm_in_kernel=True)
+        return (out, st) if return_state else out
+    return recurrent_delta_rule(q, k, v, g, beta, initial_state, return_state)
 
-def recurrent_delta_rule(q, k, v, g, beta):
-    """逐次版（参照用）。q/k は L2 正規化とスケーリング済みを渡す。"""
-    b, t, h, dk = k.shape
-    dv = v.shape[-1]
-    q = F.normalize(q.float(), dim=-1, eps=1e-6) / (dk ** 0.5)
-    k = F.normalize(k.float(), dim=-1, eps=1e-6)
-    v = v.float()
-    state = torch.zeros((b, h, dk, dv), dtype=torch.float32, device=q.device)
-    out = torch.zeros((b, t, h, dv), dtype=torch.float32, device=q.device)
-    for i in range(t):
-        state = state * g[:, i].exp()[..., None, None]
-        kv_mem = (state * k[:, i][..., None]).sum(-2)
-        delta = (v[:, i] - kv_mem) * beta[:, i][..., None]
-        state = state + k[:, i][..., None] * delta[..., None, :]
-        out[:, i] = (state * q[:, i][..., None]).sum(-2)
-    return out
+
+class Qwen38Cache:
+    """full attention は K/V、線形注意は再帰状態と conv 履歴を持つ。"""
+
+    def __init__(self, cfg, batch: int = 1, device=None, dtype=torch.float16):
+        n = int(cfg.num_hidden_layers)
+        self.k: list[torch.Tensor | None] = [None] * n
+        self.v: list[torch.Tensor | None] = [None] * n
+        self.state: list[torch.Tensor | None] = [None] * n
+        self.conv: list[torch.Tensor | None] = [None] * n
+        self.len = 0
+        self.device = device
+        self.dtype = dtype
 
 
 class Mlp:
@@ -100,10 +115,10 @@ class FullAttention:
         self.qn, self.kn = g("q_norm.weight"), g("k_norm.weight")
         self.nh, self.nkv, self.hd = cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim
         self.rope_dim = int(self.hd * cfg.partial_rotary_factor)
-        self.eps, self.gate_type = cfg.rms_norm_eps, cfg.output_gate_type
+        self.eps = cfg.rms_norm_eps
         self.scale = self.hd ** -0.5
 
-    def __call__(self, x, cos, sin):
+    def __call__(self, x, cos, sin, cache=None, layer: int | None = None):
         b, t, _ = x.shape
         qg = (x @ self.q.T).view(b, t, self.nh, self.hd * 2)
         q, gate = qg.chunk(2, dim=-1)
@@ -114,20 +129,31 @@ class FullAttention:
         if rd < self.hd:
             q = torch.cat([q[..., :rd] * c + rotate_half(q[..., :rd]) * s, q[..., rd:]], -1)
             k = torch.cat([k[..., :rd] * c + rotate_half(k[..., :rd]) * s, k[..., rd:]], -1)
-        q = q.transpose(1, 2)
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
-        out = F.scaled_dot_product_attention(q, k, v, is_causal=True, scale=self.scale,
-                                             enable_gqa=self.nh != self.nkv)
+        q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+        past = 0
+        if cache is not None and layer is not None:
+            if cache.k[layer] is not None:
+                past = cache.k[layer].shape[2]
+                k = torch.cat([cache.k[layer], k], dim=2)
+                v = torch.cat([cache.v[layer], v], dim=2)
+            cache.k[layer], cache.v[layer] = k, v
+        if past == 0:
+            out = F.scaled_dot_product_attention(q, k, v, is_causal=True, scale=self.scale,
+                                                 enable_gqa=self.nh != self.nkv)
+        else:
+            total = past + t
+            qi = torch.arange(t, device=q.device)[:, None] + past
+            ki = torch.arange(total, device=q.device)[None, :]
+            mask = ki <= qi
+            out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, scale=self.scale,
+                                                 enable_gqa=self.nh != self.nkv)
         out = out.transpose(1, 2).reshape(b, t, self.nh * self.hd)
-        gate = gate.reshape(b, t, -1)
-        # 参照実装は output_gate_type に関わらず sigmoid を掛ける
-        gate = torch.sigmoid(gate)
+        gate = torch.sigmoid(gate.reshape(b, t, -1))
         return (out * gate.float()).to(x.dtype) @ self.o.T
 
 
 class GatedDeltaNet:
-    """線形注意層（gated delta rule）。参照実装と同じ逐次更新。"""
+    """線形注意層（gated delta rule）。再帰状態と conv 履歴をキャッシュできる。"""
 
     def __init__(self, cfg, prefix: str, sd: dict, dtype, device):
         g = lambda n: sd[f"{prefix}.{n}"].to(device=device, dtype=dtype)
@@ -143,18 +169,24 @@ class GatedDeltaNet:
         self.kdim, self.vdim = self.nk * self.hk, self.nv * self.hv
         self.chunk_size = 64
 
-    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+    def __call__(self, x: torch.Tensor, cache=None, layer: int | None = None) -> torch.Tensor:
         b, t, _ = x.shape
         q, k, v = torch.split(x @ self.qkv.T, [self.kdim, self.kdim, self.vdim], dim=-1)
         z = x @ self.z.T
         beta = torch.sigmoid(x @ self.b_w.T)
         a = x @ self.a_w.T
-        # depthwise 因果 conv（活性 silu）
+        # depthwise 因果 conv（活性 silu）。キャッシュがあれば直前の入力を前置きする
         seq = torch.cat([q, k, v], -1).transpose(1, 2)
         w = self.conv_w.squeeze(1)
         ksz = w.shape[-1]
+        if cache is not None and layer is not None and cache.conv[layer] is not None:
+            seq = torch.cat([cache.conv[layer], seq], dim=2)
+        if cache is not None and layer is not None:
+            cache.conv[layer] = seq[:, :, -(ksz - 1):].detach() if ksz > 1 else None
         pad = F.pad(seq, (ksz - 1, 0))
-        conv = sum(w[:, i][None, :, None] * pad[:, :, i:i + t] for i in range(ksz))
+        # 履歴を前置きした場合は、末尾 t 個の出力に対応する窓を使う
+        off = seq.shape[-1] - t
+        conv = sum(w[:, i][None, :, None] * pad[:, :, off + i:off + i + t] for i in range(ksz))
         q, k, v = torch.split(F.silu(conv).transpose(1, 2), [self.kdim, self.kdim, self.vdim], -1)
         q = q.view(b, t, self.nk, self.hk)
         k = k.view(b, t, self.nk, self.hk)
@@ -166,8 +198,11 @@ class GatedDeltaNet:
         q = q.float()
         k = k.float()
         v = v.float()
-        out = delta_rule(q, k, v, decay, beta, self.chunk_size)
-        # RMSNormGated は value head ごと（head_v_dim 単位）に正規化する
+        state = cache.state[layer] if (cache is not None and layer is not None) else None
+        out, new_state = delta_rule(q, k, v, decay, beta, self.chunk_size,
+                                    initial_state=state, return_state=True)
+        if cache is not None and layer is not None:
+            cache.state[layer] = new_state.detach()
         v_ = out.pow(2).mean(-1, keepdim=True)
         out = rms_norm(out, self.norm_w, self.eps, plus_one=False).float()
         out = out * F.silu(z.reshape(b, t, self.nv, self.hv).float())
@@ -192,18 +227,26 @@ class Qwen38Model:
                                 sd[p + ".input_layernorm.weight"].to(device=device, dtype=dtype),
                                 sd[p + ".post_attention_layernorm.weight"].to(device=device, dtype=dtype)))
 
-    def __call__(self, ids: torch.Tensor) -> torch.Tensor:
+    def new_cache(self, batch: int = 1) -> Qwen38Cache:
+        return Qwen38Cache(self.cfg, batch, self.device)
+
+    def __call__(self, ids: torch.Tensor, cache: "Qwen38Cache | None" = None,
+                 start_pos: int = 0) -> torch.Tensor:
         ids = ids.view(-1)
         t = ids.numel()
         x = self.embed[ids].unsqueeze(0)
-        pos = torch.arange(t, device=x.device)
-        cos, sin = rope_tables(pos, int(self.cfg.head_dim * self.cfg.partial_rotary_factor),
-                              self.cfg.rope_theta, x.dtype)
+        rd = int(self.cfg.head_dim * self.cfg.partial_rotary_factor)
+        positions = torch.arange(start_pos, start_pos + t, device=x.device)
+        cos, sin = rope_tables(positions, rd, self.cfg.rope_theta, x.dtype)
         cos, sin = cos[None], sin[None]
-        for lt, mixer, mlp, ln1, ln2 in self.layers:
+        for i, (lt, mixer, mlp, ln1, ln2) in enumerate(self.layers):
             h = rms_norm(x, ln1, self.cfg.rms_norm_eps)
-            x = x + (mixer(h, cos, sin) if lt == "full_attention" else mixer(h))
+            mix = (mixer(h, cos, sin, cache, i) if lt == "full_attention"
+                   else mixer(h, cache, i))
+            x = x + mix
             x = x + mlp(rms_norm(x, ln2, self.cfg.rms_norm_eps))
+        if cache is not None:
+            cache.len = start_pos + t
         x = rms_norm(x, self.norm_w, self.cfg.rms_norm_eps)
         return (x @ self.head.T)[:, -1]
 
@@ -250,14 +293,19 @@ def load_qwen38(path: str, dtype=None, device: str | None = None):
                        device=device or ("cuda" if torch.cuda.is_available() else "cpu"))
 
 
-def generate(model: "Qwen38Model", ids, max_tokens: int = 32, temperature: float = 0.0,
-             eos_token_ids=()) -> list[int]:
-    # 履歴を持たないので毎回プロンプト全体を作り直す（遅いが単純）
-    out: list[int] = []
+def generate(model: Qwen38Model, ids, max_tokens: int = 32, temperature: float = 0.0,
+             eos_token_ids=(), use_cache: bool = True) -> list[int]:
+    # キャッシュがあれば 1 トークンずつ進む（無ければ毎回作り直す）
+    dev = model.device
     seq = list(ids)
+    out: list[int] = []
     stop = set(eos_token_ids)
+    cache = model.new_cache() if use_cache else None
+    if cache is not None:
+        logits = model(torch.tensor(seq, dtype=torch.long, device=dev), cache, 0)[0]
+    else:
+        logits = model(torch.tensor(seq, dtype=torch.long, device=dev))[0]
     for _ in range(max_tokens):
-        logits = model(torch.tensor(seq, dtype=torch.long, device=model.device))[0]
         if temperature and temperature > 0:
             nxt = int(torch.multinomial(torch.softmax(logits.float() / temperature, -1), 1).item())
         else:
@@ -266,4 +314,8 @@ def generate(model: "Qwen38Model", ids, max_tokens: int = 32, temperature: float
         seq.append(nxt)
         if nxt in stop:
             break
+        if cache is not None:
+            logits = model(torch.tensor([nxt], dtype=torch.long, device=dev), cache, cache.len)[0]
+        else:
+            logits = model(torch.tensor(seq, dtype=torch.long, device=dev))[0]
     return out
