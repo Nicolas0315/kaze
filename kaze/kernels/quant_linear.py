@@ -335,6 +335,15 @@ def gemv(x: torch.Tensor, lin: QuantLinear, tdim: int, row_off: int = 0,
     """
     n = n_override if n_override is not None else lin.n
     k = lin.k
+
+    if (getattr(lin, "packed_tm", None) is not None and lin.packed_tm.dim() == 3
+            and add_to is None and n_override is None and tdim == 16):
+        from kaze.kernels.tm import gemv as _tm_gemv
+        out = torch.empty((tdim, n), dtype=torch.float16, device=x.device)
+        _tm_gemv[(triton.cdiv(n, 128),)](
+            x, lin.packed_tm, lin.scales, out, n, k,
+            BLOCK_N=128, G=lin.group, TDIM=tdim, num_warps=8, num_stages=3)
+        return out
     packed = lin.packed if row_off == 0 else lin.packed[row_off:]
     scales = lin.scales if (row_off == 0 or lin.scales is None) else lin.scales[row_off:]
     block_k = min(block_k or lin.group, lin.group, k)
