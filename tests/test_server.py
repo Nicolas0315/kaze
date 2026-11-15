@@ -120,8 +120,9 @@ def main() -> int:
                                       "stop": ["three"]})
         txt = st["choices"][0]["text"]
         ok = "three" not in txt.lower()
-        # 既知の課題: completions の stop が効いていない（docs/evidence.md 参照）
-        print(f"stop string   {txt!r} {'ok' if ok else 'KNOWN GAP'}")
+                print(f"stop string   {txt!r} {'ok' if ok else 'FAIL'}")
+        if not ok:
+            fails.append("stop")
 
         # 同時 4 リクエストがすべて返る
         import threading

@@ -93,6 +93,15 @@ def create_app(llm: LLM, model_name: str = "kaze") -> FastAPI:
     return app
 
 
+def _trim_stop(text: str, stops) -> str:
+    """OpenAI と同じく、stop 文字列自体は出力に含めない。"""
+    for stop in stops or []:
+        i = text.find(stop)
+        if i >= 0:
+            return text[:i]
+    return text
+
+
 async def _serve(llm: LLM, ids: list[int], params: SamplingParams, stream: bool,
                  model_name: str, chat: bool) -> Any:
     loop = asyncio.get_running_loop()
@@ -112,6 +121,7 @@ async def _serve(llm: LLM, ids: list[int], params: SamplingParams, stream: bool,
             if out.finished:
                 break
         text = llm.tokenizer.decode(tokens, skip_special_tokens=True)
+        text = _trim_stop(text, params.stop)
         reason = out.finish_reason or "stop"
         if chat:
             return {"id": cid, "object": "chat.completion", "created": created,
@@ -133,6 +143,7 @@ async def _serve(llm: LLM, ids: list[int], params: SamplingParams, stream: bool,
             if out.tokens:
                 tokens.extend(out.tokens)
                 text = llm.tokenizer.decode(tokens, skip_special_tokens=True)
+                text = _trim_stop(text, params.stop)
                 delta = text[sent:]
                 sent = len(text)
                 if delta:
