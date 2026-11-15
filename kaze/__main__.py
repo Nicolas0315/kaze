@@ -26,14 +26,24 @@ def _maybe_qwen38(args) -> bool:
 
     from kaze.qwen38 import generate, load_qwen38
 
-    tok = AutoTokenizer.from_pretrained(path)
+    try:
+        tok = AutoTokenizer.from_pretrained(path)
+        ids = tok(args.prompt).input_ids
+        if not ids:      # tokenizer だけ有って語彙が合わない場合は id 直指定に落とす
+            raise ValueError("empty encoding")
+        decode = lambda t: tok.decode(t, skip_special_tokens=True)
+        eos = (tok.eos_token_id,) if tok.eos_token_id is not None else ()
+    except Exception:
+        # tokenizer が無いディレクトリ（重みだけの配布）では id をそのまま使う
+        tok = None
+        ids = [int(x) for x in args.prompt.replace(",", " ").split()] or [1]
+        decode = lambda t: str(t)
+        eos = ()
     model = load_qwen38(path)
-    ids = tok(args.prompt).input_ids
     t0 = time.perf_counter()
-    out = generate(model, ids, max_tokens=args.max_tokens, temperature=args.temperature,
-                   eos_token_ids=(tok.eos_token_id,) if tok.eos_token_id is not None else ())
+    out = generate(model, ids, max_tokens=args.max_tokens,                   temperature=args.temperature, eos_token_ids=eos)
     dt = time.perf_counter() - t0
-    print(tok.decode(out, skip_special_tokens=True))
+    print(decode(out))
     print(f"--- {len(out)} tokens in {dt:.2f}s ({len(out) / dt:.1f} tok/s)")
     return True
 
@@ -80,6 +90,10 @@ def main() -> None:
     b.add_argument("--repeats", type=int, default=3)
 
     args = ap.parse_args()
+    # Qwen3.8（Qwen3_5 text）は専用の経路で動かす（dense 用のローダを通さない）
+    if args.cmd == "generate" and _maybe_qwen38(args):
+        return
+
     from kaze.llm import LLM
 
     llm = LLM(args.model, kind=args.kind, group=args.group, lm_head_kind=args.lm_head_kind,
@@ -88,8 +102,6 @@ def main() -> None:
               use_cuda_graph=not args.no_cuda_graph, num_blocks=args.num_blocks,
               speculative=not args.no_spec, spec_k=args.spec_k)
 
-    if args.cmd == "generate" and _maybe_qwen38(args):
-        return
     if args.cmd == "generate":
         from kaze.sampler import SamplingParams
         p = SamplingParams(max_tokens=args.max_tokens, temperature=args.temperature)
