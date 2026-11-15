@@ -17,6 +17,10 @@ dependencies = [
     "uvicorn>=0.29",
 ]
 
+[project.urls]
+Repository = "https://github.com/sahenjp/kaze"
+Issues = "https://github.com/sahenjp/kaze/issues"
+
 [project.scripts]
 kaze = "kaze.__main__:main"
 
