@@ -25,13 +25,24 @@ def rope_tables(positions: torch.Tensor, dim: int, theta: float, dtype):
     return cos, sin
 
 
+_FUSED_RMS = True
+
+
 def rms_norm(x: torch.Tensor, w: torch.Tensor, eps: float, plus_one: bool = True) -> torch.Tensor:
-    """Qwen3_5 の RMSNorm は重みを (1 + w) として掛ける（初期値はゼロ）。"""
+    """Qwen3_5 の RMSNorm。CUDA では融合カーネル、CPU では素直な計算。"""
+    # 融合カーネルは fp16 専用。線形注意の出力は fp32 なので、そのままは使えない
+    if x.is_cuda and _FUSED_RMS and x.dtype == torch.float16:
+        import kaze.kernels.norm as KN
+
+        shape = x.shape
+        w_eff = (1.0 + w) if plus_one else w
+        # chunk の結果など非連続なビューが来るので、必ず詰めてからカーネルへ渡す
+        flat = x.reshape(-1, shape[-1]).contiguous()
+        return KN.rmsnorm(flat, w_eff, eps).reshape(shape)
     v = x.float().pow(2).mean(-1, keepdim=True)
     y = x.float() * torch.rsqrt(v + eps)
     y = y * (1.0 + w.float()) if plus_one else y * w.float()
     return y.to(x.dtype)
-
 
 def recurrent_delta_rule(q, k, v, g, beta, initial_state=None, return_state: bool = False):
     b, t, h, dk = k.shape
@@ -178,13 +189,40 @@ class Qwen38Cache:
 
 class Mlp:
     def __init__(self, prefix: str, sd: dict, dtype, device, kind="fp16", group=128):
-        get = lambda n: linear(sd[f"{prefix}.{n}"], kind, group, device, dtype)
-        self.gate, self.up, self.down = (get("gate_proj.weight"), get("up_proj.weight"),
-                                         get("down_proj.weight"))
+        gw = sd[f"{prefix}.gate_proj.weight"]
+        uw = sd[f"{prefix}.up_proj.weight"]
+        dw = sd[f"{prefix}.down_proj.weight"]
+        self.nh = gw.shape[0]
+        self.k = gw.shape[1]
+        self.quant = kind in ("int8", "int4", "mixed")
+        self.down = linear(dw, kind, group, device, dtype)
+        if self.quant:
+            # gate と up を 1 枚にまとめて、silu まで込みのカーネルで積む
+            self.gate_up = QLinear(torch.cat([gw, uw], dim=0),
+                                   "int8" if kind == "mixed" else kind, group, device, dtype)
+            self._pad = None
+        else:
+            self.gate = Dense(gw, dtype, device)
+            self.up = Dense(uw, dtype, device)
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
-        return self.down(F.silu(self.gate(x)) * self.up(x))
+        if not self.quant:
+            return self.down(F.silu(self.gate(x)) * self.up(x))
+        import kaze.kernels.quant_linear as K
 
+        shape = x.shape[:-1]
+        rows = 1
+        for s in shape:
+            rows *= s
+        flat = x.reshape(rows, self.k)
+        if rows == 1:
+            if self._pad is None or self._pad.device != flat.device:
+                self._pad = torch.zeros((16, self.k), dtype=flat.dtype, device=flat.device)
+            self._pad[0].copy_(flat[0])
+            out = K.gemv_swiglu(self._pad, self.gate_up.lin, 16, self.nh)[:1]
+        else:
+            out = K.gemm_swiglu(flat.contiguous(), self.gate_up.lin, self.nh)
+        return self.down(out.reshape(*shape, self.nh))
 
 class FullAttention:
     """full attention 層。q_proj は出力ゲートと半分ずつに分かれる。"""
