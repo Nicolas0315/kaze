@@ -117,8 +117,22 @@ class QuantLinear:
                   n, k, group, kind, dtype=torch.float16)
         import os as _os
 
-        if kind == "int4" and _os.environ.get("KAZE_INT4_TM") == "1" and n * k >= (1 << 20):
-            out.make_tile_major_copy()
+        want_tm = _os.environ.get("KAZE_INT4_TM")
+        if kind == "int4" and n * k >= (1 << 20) and want_tm != "0":
+            if want_tm == "1":
+                out.make_tile_major_copy()
+            else:
+                # 未指定なら空き VRAM を見て決める（重みが 2 倍になるため）
+                try:
+                    import torch as _t
+
+                    # カード全体の VRAM で判断する（読み込み途中の空きを見ると
+                    # 8GB 級でも通ってしまい、後で OOM になる）
+                    total = _t.cuda.get_device_properties(0).total_memory
+                    if total >= 20 * (1 << 30):
+                        out.make_tile_major_copy()
+                except Exception:
+                    pass
         return out
 
     def make_tile_major_copy(self) -> None:
