@@ -78,11 +78,13 @@ class QuantLinear:
     GEMV/GEMM serves all of them.
     """
 
-    __slots__ = ("packed", "scales", "bias", "n", "k", "group", "kind", "dtype", "scratch")
+    __slots__ = ("packed", "scales", "bias", "n", "k", "group", "kind", "dtype",
+                 "scratch", "packed_tm")
 
     def __init__(self, packed: torch.Tensor, scales: torch.Tensor | None, bias: torch.Tensor | None,
                  n: int, k: int, group: int, kind: str, dtype: torch.dtype = torch.float16):
         self.packed = packed
+        self.packed_tm = None
         self.scales = scales
         self.bias = bias
         self.n = n
@@ -113,6 +115,21 @@ class QuantLinear:
         del packed_parts, scale_parts
         return cls(packed, scales, bias.half().contiguous() if bias is not None else None,
                    n, k, group, kind, dtype=torch.float16)
+
+    def make_tile_major_copy(self) -> None:
+        """decode 用に [K/G, N, G/2] の複製を作る（2-D の重みは prefill 用に残す）。"""
+        if self.kind != "int4" or self.packed.dim() != 2:
+            return
+        g = self.group
+        n, half = self.packed.shape
+        blocks = self.k // g
+        src = self.packed.view(torch.int8)
+        dst = src.new_empty((blocks, n, g // 2))
+        step = max(1, (1 << 22) // max(n * (g // 2), 1))
+        for b0 in range(0, blocks, step):
+            b1 = min(blocks, b0 + step)
+            dst[b0:b1] = src[:, b0 * (g // 2):b1 * (g // 2)].view(n, b1 - b0, g // 2).permute(1, 0, 2)
+        self.packed_tm = dst.contiguous()
 
     @property
     def nbytes(self) -> int:

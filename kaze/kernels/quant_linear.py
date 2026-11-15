@@ -647,6 +647,14 @@ def gemv_swiglu(x: torch.Tensor, lin: QuantLinear, tdim: int, nh: int,
                 out: torch.Tensor | None = None, num_warps: int = 4,
                 num_stages: int = 2, xq: torch.Tensor | None = None,
                 xs: torch.Tensor | None = None) -> torch.Tensor:
+    if getattr(lin, "packed_tm", None) is not None and lin.packed_tm.dim() == 3:
+        from kaze.kernels.tm import gemv_swiglu as _tm_swiglu
+        nh = lin.n // 2
+        out = torch.empty((tdim, nh), dtype=torch.float16, device=x.device)
+        _tm_swiglu[(triton.cdiv(nh, 128),)](
+            x, lin.packed_tm, lin.scales, out, nh, lin.k,
+            BLOCK_N=128, G=lin.group, TDIM=tdim, num_warps=8, num_stages=3)
+        return out
     """x [tdim, K] -> act [tdim, nh] with act = silu(gate) * up."""
     k = lin.k
     block_k = min(block_k or lin.group, lin.group, k)
