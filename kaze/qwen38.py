@@ -484,13 +484,13 @@ class GraphDecoder:
                 self.model(self.ids, self.cache)
         torch.cuda.current_stream().wait_stream(side)
         torch.cuda.synchronize()
-        self._reset()
+        self.reset()
         self.graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(self.graph):
             self.logits = self.model(self.ids, self.cache)
-        self._reset()
+        self.reset()
 
-    def _reset(self):
+    def reset(self):
         c = self.cache
         for buf in (c.k, c.v, c.conv, c.state):
             for item in buf:
@@ -523,3 +523,34 @@ def generate_graph(model: "Qwen38Model", ids, max_tokens: int = 64, max_len: int
             break
         logits = dec.decode(nxt)
     return out
+
+
+def stream_tokens(model: "Qwen38Model", ids, max_tokens: int = 32,
+                  temperature: float = 0.0, eos_token_ids=(), graph: bool = False,
+                  max_len: int | None = None, decoder=None):
+    """トークンを 1 個ずつ返す。サーバのストリーミングと CLI で共用。"""
+    dev = model.device
+    stop = set(eos_token_ids)
+    if decoder is not None:
+        decoder.reset()
+        dec = decoder
+        logits = dec.prefill(ids)
+    elif graph:
+        dec = GraphDecoder(model, max_len=max_len or max(len(ids) + max_tokens + 8, 256))
+        logits = dec.prefill(ids)
+    else:
+        dec = None
+        cache = model.new_cache()
+        logits = model(torch.tensor(list(ids), dtype=torch.long, device=dev), cache, 0)[0]
+    for _ in range(max_tokens):
+        if temperature and temperature > 0:
+            nxt = int(torch.multinomial(torch.softmax(logits.float() / temperature, -1), 1).item())
+        else:
+            nxt = int(logits.argmax().item())
+        yield nxt
+        if nxt in stop:
+            return
+        if dec is not None:
+            logits = dec.decode(nxt)
+        else:
+            logits = model(torch.tensor([nxt], dtype=torch.long, device=dev), cache, cache.len)[0]

@@ -165,8 +165,18 @@ def check_vlm_keys() -> bool:
 
 
 
+def _clean_cuda():
+    import gc
+
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+
+
 def check_graph() -> bool:
     """CUDA Graph 版の decode が素の生成と同じ結果になるか。"""
+    _clean_cuda()
     if not torch.cuda.is_available():
         print("graph: skip (cuda not available)")
         return True
@@ -189,7 +199,67 @@ def check_graph() -> bool:
     return a == b
 
 
+
+
+class _StubTok:
+    eos_token_id = 2
+
+    def __call__(self, text):
+        class R:
+            input_ids = [ord(c) % 200 + 10 for c in (text or "x")][:32] or [5]
+
+        return R()
+
+    def decode(self, ids, skip_special_tokens=True):
+        return "".join(chr(i % 90 + 32) for i in ids)
+
+    def apply_chat_template(self, msgs, tokenize=False, add_generation_prompt=True, **kw):
+        return "\n".join(m["content"] for m in msgs) + "\nassistant:"
+
+
+def check_server() -> bool:
+    """Qwen3.8 用の HTTP サーバが OpenAI 互換で応答するか。"""
+    if not torch.cuda.is_available():
+        print("server: skip (cuda not available)")
+        return True
+    _clean_cuda()
+    from fastapi.testclient import TestClient
+    from transformers import AutoModelForCausalLM, Qwen3_5TextConfig
+
+    from kaze.qwen38_server import create_app
+
+    raw = dict(BASE, layer_types=LAYER_TYPES[:2], num_hidden_layers=2,
+               hidden_size=128, intermediate_size=256, num_attention_heads=4,
+               num_key_value_heads=2, head_dim=32, max_position_embeddings=256,
+               vocab_size=256)
+    torch.manual_seed(0)
+    ref = AutoModelForCausalLM.from_config(Qwen3_5TextConfig(**raw),
+                                          dtype=torch.float32).eval()
+    sd = {k: v.detach() for k, v in ref.state_dict().items()}
+    model = Qwen38Model(Qwen38Config(raw), sd, dtype=torch.float16, device="cuda")
+    client = TestClient(create_app(model, _StubTok(), graph=False))
+    ok = client.get("/health").status_code == 200
+    r = client.post("/v1/chat/completions",
+                    json={"messages": [{"role": "user", "content": "hi"}],
+                          "max_tokens": 4})
+    ok = ok and r.status_code == 200 and r.json()["usage"]["completion_tokens"] >= 1
+    r2 = client.post("/v1/completions", json={"prompt": "abc", "max_tokens": 3})
+    ok = ok and r2.status_code == 200
+    with client.stream("POST", "/v1/chat/completions",
+                       json={"messages": [{"role": "user", "content": "x"}],
+                             "max_tokens": 3, "stream": True}) as s:
+        lines = [ln for ln in s.iter_lines() if ln]
+    ok = ok and lines[-1] == "data: [DONE]"
+    print("server: health/chat/completion/stream ok=%s" % ok)
+    return ok
+
+
 def main() -> int:
+    if "--only" in sys.argv:
+        which = sys.argv[sys.argv.index("--only") + 1]
+        if which == "graph":
+            return 0 if check_graph() else 1
+        raise SystemExit(f"unknown check: {which}")
     try:
         from transformers import AutoModelForCausalLM, Qwen3_5TextConfig
         from transformers.models.auto.configuration_auto import CONFIG_MAPPING_NAMES
@@ -216,7 +286,7 @@ def main() -> int:
     print("hybrid 4層（線形2 + full2）: cos %.6f  maxdiff %.6f" % (cos, diff))
     ok = (cos > 0.999 and check_load_and_generate() and check_cache()
           and check_quantised() and check_vlm_keys()
-          and check_graph())
+          and check_server())
     print("ok" if ok else "FAIL")
     return 0 if ok else 1
 

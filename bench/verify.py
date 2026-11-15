@@ -46,6 +46,11 @@ def main() -> int:
     if rc != 0:
         bad.append("smoke")
     rc, out = run([sys.executable, "tests/test_qwen38.py"])
+    rc2, out2 = run([sys.executable, "tests/test_qwen38.py", "--only", "graph"])
+    gline = [l for l in out2.splitlines() if l.startswith("graph:")]
+    print(f"qwen3.8 CUDA Graph        {gline[-1] if gline else "FAILED"}")
+    if rc2 != 0:
+        bad.append("qwen3.8 graph")
     line = [l for l in out.splitlines() if l.strip() in ("ok", "FAIL")]
     print(f"qwen3.8 (Qwen3_5)          {line[-1] if line else "FAILED"}")
     if rc != 0:

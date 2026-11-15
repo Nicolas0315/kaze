@@ -48,6 +48,33 @@ def _maybe_qwen38(args) -> bool:
     return True
 
 
+def _maybe_qwen38_serve(args) -> bool:
+    """Qwen3.8（Qwen3_5 text）なら専用の HTTP サーバを立てて True を返す。"""
+    import json
+    import os
+
+    cfg_path = os.path.join(args.model, "config.json")
+    if not os.path.isfile(cfg_path):
+        return False
+    with open(cfg_path, encoding="utf-8") as f:
+        raw = json.load(f)
+    if raw.get("text_config", raw).get("model_type") not in ("qwen3_5_text", "qwen3_5"):
+        return False
+
+    import uvicorn
+    from transformers import AutoTokenizer
+
+    from kaze.qwen38 import load_qwen38
+    from kaze.qwen38_server import create_app
+
+    tok = AutoTokenizer.from_pretrained(args.model)
+    model = load_qwen38(args.model, kind=getattr(args, "kind", "int8"))
+    app = create_app(model, tok, model_name=os.path.basename(args.model.rstrip("/")),
+                     graph=getattr(args, "graph", False))
+    uvicorn.run(app, host=args.host, port=args.port)
+    return True
+
+
 def main() -> None:
     ap = argparse.ArgumentParser("kaze")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -94,6 +121,8 @@ def main() -> None:
     args = ap.parse_args()
     # Qwen3.8（Qwen3_5 text）は専用の経路で動かす（dense 用のローダを通さない）
     if args.cmd == "generate" and _maybe_qwen38(args):
+        return
+    if args.cmd == "serve" and _maybe_qwen38_serve(args):
         return
 
     from kaze.llm import LLM
