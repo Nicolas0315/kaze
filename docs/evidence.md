@@ -630,3 +630,20 @@ tile-major は decode の GEMV で +8%（360 GB/s）でしたが、そのまま�
 **次の作業者への申し送り**: tile-major の +8% は本物ですが、採るなら 4 本のカーネル
 （gemv・gemv_swiglu・gemm・gemm_swiglu の tile-major 版）を揃える必要があります。
 揃わない状態で一部だけ入れ替えると、prefill が落ちます。
+
+#### tile-major 版 swiglu は +37%（round 43・本命）
+
+7B の重みの 54% を占める gate_up について、tile-major 版の swiglu カーネルを書いて測りました。
+
+| カーネル | 時間 | 実効帯域 |
+|---|---|---|
+| 現行 `gemv_swiglu` | 0.284 ms | 239 GB/s |
+| **tile-major swiglu** | **0.207 ms** | **328 GB/s（+37%）** |
+
+数値も一致します（cos 0.999512、fp16 の丸め範囲）。
+
+7B 全体への効き目を粗く見積もると、gate_up が 239 → 328 GB/s になることで
+実効 279 → 330 GB/s、**decode は 70 → 約 82 tok/s**。他実装の 82.2 と並ぶ計算です。
+
+実験用カーネルは `bench/tm_kernels.py` に置きました（エンジンには未接続）。
+導入には prefill 側（`gemm` / `gemm_swiglu` の tile-major 版）も必要です。
