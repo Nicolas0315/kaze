@@ -48,6 +48,8 @@ class CompletionRequest(BaseModel):
 
 def _params(max_tokens: int, temperature: float, top_p: float, top_k: int,
             repetition_penalty: float, stop, ignore_eos: bool, seed) -> SamplingParams:
+    # 極端な値をそのまま流すと 1 リクエストが GPU を長時間占有してしまう
+    max_tokens = max(1, min(int(max_tokens), 4096))
     stops = stop if isinstance(stop, list) else ([stop] if stop else [])
     return SamplingParams(max_tokens=max_tokens, temperature=temperature, top_p=top_p,
                           top_k=top_k or 0, repetition_penalty=repetition_penalty,

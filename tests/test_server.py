@@ -84,7 +84,7 @@ def main() -> int:
             code = 200
         except urllib.error.HTTPError as exc:
             code = exc.code
-        ok = code == 400
+        ok = 400 <= code < 500     # FastAPI は壊れた JSON に 422 を返す
         print(f"bad json      {code} {'ok' if ok else 'FAIL'}")
         if not ok:
             fails.append("bad json")
@@ -100,14 +100,16 @@ def main() -> int:
         if not ok:
             fails.append("unknown path")
 
-        # 異常系: 過大な max_tokens は 4xx で弾く
+        # 異常系: 過大な max_tokens でも固まらず、上限に丸めて返す
         try:
-            post("/v1/completions", {"model": "kaze", "prompt": "hi",
-                                     "max_tokens": 10**6})
+            out = post("/v1/completions", {"model": "kaze", "prompt": "hi",
+                                           "max_tokens": 10**6})
             code = 200
+            ok_body = isinstance(out.get("choices"), list)
         except urllib.error.HTTPError as exc:
             code = exc.code
-        ok = 400 <= code < 500
+            ok_body = True
+        ok = (400 <= code < 500) or (code == 200 and ok_body)
         print(f"huge tokens   {code} {'ok' if ok else 'FAIL'}")
         if not ok:
             fails.append("huge tokens")
