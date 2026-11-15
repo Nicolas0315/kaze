@@ -26,6 +26,7 @@ def rope_tables(positions: torch.Tensor, dim: int, theta: float, dtype):
 
 
 _FUSED_RMS = True
+_FUSED_DELTA = True
 _ROPE_CACHE = True
 
 
@@ -306,6 +307,7 @@ class GatedDeltaNet:
         self.eps = cfg.rms_norm_eps
         self.kdim, self.vdim = self.nk * self.hk, self.nv * self.hv
         self.chunk_size = 64
+        self._out = None
 
     def __call__(self, x: torch.Tensor, cache=None, layer: int | None = None) -> torch.Tensor:
         b, t, _ = x.shape
@@ -344,12 +346,25 @@ class GatedDeltaNet:
         state = None
         if cache is not None and layer is not None:
             state = cache.state[layer]
-        out, new_state = delta_rule(q, k, v, decay, beta, self.chunk_size,
-                                    initial_state=state, return_state=True)
-        if state is not None and new_state is not None:
-            state.copy_(new_state)          # 固定長バッファに書き戻す（グラフ化できる形）
-        elif cache is not None and layer is not None:
-            cache.state[layer] = new_state.detach()   # 動的キャッシュは差し替え
+        if (state is not None and t == 1 and _FUSED_DELTA and q.is_cuda
+                and state.shape[0] == 1):
+            # 1 トークンは正規化から状態更新まで 1 回の起動で済ませる
+            from kaze.kernels.delta import delta_step
+
+            if self._out is None or self._out.device != q.device:
+                self._out = torch.empty((self.nv, self.hv), dtype=torch.float32,
+                                        device=q.device)
+            delta_step(q[0, 0].contiguous(), k[0, 0].contiguous(),
+                       v[0, 0].contiguous(), decay[0, 0].contiguous(),
+                       beta[0, 0].contiguous(), state[0], self._out)
+            out = self._out.unsqueeze(0).unsqueeze(0)
+        else:
+            out, new_state = delta_rule(q, k, v, decay, beta, self.chunk_size,
+                                        initial_state=state, return_state=True)
+            if state is not None and new_state is not None:
+                state.copy_(new_state)
+            elif cache is not None and layer is not None:
+                cache.state[layer] = new_state.detach()
         v_ = out.pow(2).mean(-1, keepdim=True)
         out = rms_norm(out, self.norm_w, self.eps, plus_one=False).float()
         out = out * F.silu(z.reshape(b, t, self.nv, self.hv).float())
