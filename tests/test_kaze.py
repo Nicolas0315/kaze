@@ -423,6 +423,38 @@ def _() -> None:
 
 
 
+
+
+@check("量子化の境界（group 非整除・group 64・int8）")
+def _() -> None:
+    """from_float の分岐が想定どおりに落ちること。"""
+    import torch
+
+    from kaze.kernels import quant_linear as K
+    from kaze.quant import QuantLinear
+
+    torch.manual_seed(11)
+    # 1) k が group で割り切れない -> fp16 にフォールバックする
+    w = (torch.randn(256, 1000, device="cuda") * 0.02).half()
+    lin = QuantLinear.from_float(w, None, kind="int4", group=128)
+    assert lin.kind == "fp16", f"kind={lin.kind}"
+
+    # 2) group=64 の int4 が動く
+    w2 = (torch.randn(512, 1024, device="cuda") * 0.02).half()
+    lin2 = QuantLinear.from_float(w2, None, kind="int4", group=64)
+    x = (torch.randn(16, 1024, device="cuda") * 0.5).half()
+    y = K.gemv(x, lin2, 16)
+    ref = (x.float() @ w2.float().T)
+    cos = torch.nn.functional.cosine_similarity(y.float().flatten(), ref.flatten(), 0).item()
+    assert cos > 0.98, f"int4 group64 cos={cos:.4f}"
+
+    # 3) int8 は int4 より誤差が小さい
+    lin8 = QuantLinear.from_float(w2, None, kind="int8", group=64)
+    y8 = K.gemv(x, lin8, 16)
+    cos8 = torch.nn.functional.cosine_similarity(y8.float().flatten(), ref.flatten(), 0).item()
+    assert cos8 > cos, f"int8 {cos8:.5f} <= int4 {cos:.5f}"
+
+
 if __name__ == "__main__":
     sys.exit(main())
 
