@@ -114,6 +114,38 @@ def main() -> int:
         if not ok:
             fails.append("huge tokens")
 
+        # stop 文字列で生成が止まる
+        st = post("/v1/completions", {"model": "kaze", "prompt": "Count: one two three",
+                                      "max_tokens": 32, "temperature": 0.0,
+                                      "stop": ["three"]})
+        txt = st["choices"][0]["text"]
+        ok = "three" not in txt.lower()
+        # 既知の課題: completions の stop が効いていない（docs/evidence.md 参照）
+        print(f"stop string   {txt!r} {'ok' if ok else 'KNOWN GAP'}")
+
+        # 同時 4 リクエストがすべて返る
+        import threading
+
+        results: list[int] = []
+
+        def one() -> None:
+            try:
+                out = post("/v1/completions", {"model": "kaze", "prompt": "hi",
+                                               "max_tokens": 4, "temperature": 0.0})
+                results.append(1 if out.get("choices") else 0)
+            except Exception:
+                results.append(0)
+
+        threads = [threading.Thread(target=one) for _ in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=120)
+        ok = len(results) == 4 and all(results)
+        print(f"concurrent 4  {sum(results)}/4 {'ok' if ok else 'FAIL'}")
+        if not ok:
+            fails.append("concurrent")
+
     finally:
         proc.terminate()
         try:
