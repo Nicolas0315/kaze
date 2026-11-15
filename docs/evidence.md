@@ -791,3 +791,19 @@ round 49 では +3.2% でしたが、あのときは KV が 8 ブロックしか
 | tests/test_llm.py | **5/5 passed** |
 | tests/test_qwen38.py | **ok** |
 | tests/test_server.py | 全項目 ok（stop・同時4接続・異常系を含む） |
+
+#### 手書き CUDA の可否（round 81）
+
+ユーザーの指示で Triton 以外も可になったため、ツールチェーンを確認しました。
+
+| 項目 | 結果 |
+|---|---|
+| nvcc | /usr/local/cuda-13.4/bin/nvcc（PATH 外） |
+| torch | 2.15.0+cu132 |
+| gcc | 16.2.1（-allow-unsupported-compiler で通る） |
+| 拡張のビルド・実行 | **成功**（誤差 2.4e-7） |
+
+最初の int4 GEMV は cos 0.75（不一致）・76 GB/s（Triton 版 328 GB/s）で負けました。
+ニブルの並びは 32bit ワードに 8 個（`NIBBLE_SHIFTS = (0,4,...,28)`）と確認しましたが、
+まだ一致していません。速度も、1 要素ずつ `__half2float` しているため出ていません。
+カーネルは kaze/kernels/cuda_gemv.cu に実験として置いています（未接続）。
