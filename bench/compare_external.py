@@ -2,7 +2,7 @@
 
 llama-cpp-python が無い環境では Kaze 側だけ測ります。GGUF は環境変数で指定します。
 
-    KAZE_GGUF=/path/to/model.gguf python3 bench/compare_llamacpp.py
+    KAZE_GGUF=/path/to/model.gguf python3 bench/compare_external.py
 """
 from __future__ import annotations
 
