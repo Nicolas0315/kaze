@@ -499,9 +499,24 @@ class GraphDecoder:
         c.pos.zero_()
 
     def prefill(self, ids) -> torch.Tensor:
-        out = self.model(torch.tensor(list(ids), dtype=torch.long, device=self.ids.device),
-                         self.cache)
-        return out[0]
+        # プロンプトは素の経路（因果マスク付きの SDPA）で処理し、KV と状態を固定バッファへ移す。
+        # 固定バッファのまま前処理すると max_len 全体に対するマスクになり、長いプロンプトで損をする。
+        ids = list(ids)
+        dyn = self.model.new_cache()
+        logits = self.model(torch.tensor(ids, dtype=torch.long, device=self.ids.device), dyn)
+        c = self.cache
+        t = len(ids)
+        if t + 1 > c.max_len:
+            raise ValueError(f"プロンプトが長すぎます（{t} > {c.max_len}）。max_len を上げてください")
+        for i in range(len(c.k)):
+            if c.k[i] is not None:
+                c.k[i][:, :, :t].copy_(dyn.k[i])
+                c.v[i][:, :, :t].copy_(dyn.v[i])
+            if c.state[i] is not None:
+                c.state[i].copy_(dyn.state[i])
+                c.conv[i].copy_(dyn.conv[i])
+        c.pos[0] = t
+        return logits[0]
 
     def decode(self, token: int) -> torch.Tensor:
         self.ids[0] = token
@@ -512,6 +527,8 @@ class GraphDecoder:
 def generate_graph(model: "Qwen38Model", ids, max_tokens: int = 64, max_len: int = 2048,
                    eos_token_ids=()) -> list[int]:
     """CUDA Graph 版の貪欲生成。"""
+    if len(ids) + max_tokens + 1 > max_len:
+        raise ValueError(f"max_len が足りません（{len(ids)} + {max_tokens} > {max_len}）")
     dec = GraphDecoder(model, max_len=max_len)
     logits = dec.prefill(ids)
     out: list[int] = []
