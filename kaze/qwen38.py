@@ -26,6 +26,7 @@ def rope_tables(positions: torch.Tensor, dim: int, theta: float, dtype):
 
 
 _FUSED_RMS = True
+_ROPE_CACHE = True
 
 
 def rms_norm(x: torch.Tensor, w: torch.Tensor, eps: float, plus_one: bool = True) -> torch.Tensor:
@@ -375,6 +376,17 @@ class Qwen38Model:
                                 sd[p + ".input_layernorm.weight"].to(device=device, dtype=dtype),
                                 sd[p + ".post_attention_layernorm.weight"].to(device=device, dtype=dtype)))
 
+    def _rope_table(self, n: int, rd: int, dtype, device):
+        # 位置ごとの cos/sin を 1 度だけ作って使い回す（毎トークン作ると無駄）
+        key = (n, rd, dtype, str(device))
+        cached = (self.__dict__.setdefault("_rope_cache", {}).get(key)
+                  if _ROPE_CACHE else None)
+        if cached is None:
+            pos = torch.arange(n, device=device)
+            cached = rope_tables(pos, rd, self.cfg.rope_theta, dtype)
+            self.__dict__["_rope_cache"][key] = cached
+        return cached
+
     def new_cache(self, batch: int = 1) -> Qwen38Cache:
         return Qwen38Cache(self.cfg, batch, self.device)
 
@@ -389,11 +401,14 @@ class Qwen38Model:
         x = self.embed[ids].unsqueeze(0)
         rd = int(self.cfg.head_dim * self.cfg.partial_rotary_factor)
         if cache is not None and getattr(cache, "max_len", None):
-            positions = cache.pos + torch.arange(t, device=x.device)
+            # 位置はテンソルで来るので、あらかじめ作った表から引く
+            table = self._rope_table(cache.max_len + 1, rd, x.dtype, x.device)
+            idx = cache.pos + torch.arange(t, device=x.device)
+            cos, sin = table[0][idx][None], table[1][idx][None]
         else:
             positions = torch.arange(start_pos, start_pos + t, device=x.device)
-        cos, sin = rope_tables(positions, rd, self.cfg.rope_theta, x.dtype)
-        cos, sin = cos[None], sin[None]
+            cos, sin = rope_tables(positions, rd, self.cfg.rope_theta, x.dtype)
+            cos, sin = cos[None], sin[None]
         for i, (lt, mixer, mlp, ln1, ln2) in enumerate(self.layers):
             h = rms_norm(x, ln1, self.cfg.rms_norm_eps)
             mix = (mixer(h, cos, sin, cache, i) if lt == "full_attention"
