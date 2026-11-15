@@ -525,11 +525,14 @@ class GraphDecoder:
 
 
 def generate_graph(model: "Qwen38Model", ids, max_tokens: int = 64, max_len: int = 2048,
-                   eos_token_ids=()) -> list[int]:
-    """CUDA Graph 版の貪欲生成。"""
+                   eos_token_ids=(), decoder=None) -> list[int]:
+    """CUDA Graph 版の貪欲生成。
+
+    decoder を渡すとキャプチャを省略できる（サーバのように使い回す場合は必須）。
+    """
     if len(ids) + max_tokens + 1 > max_len:
         raise ValueError(f"max_len が足りません（{len(ids)} + {max_tokens} > {max_len}）")
-    dec = GraphDecoder(model, max_len=max_len)
+    dec = decoder or GraphDecoder(model, max_len=max_len)
     logits = dec.prefill(ids)
     out: list[int] = []
     stop = set(eos_token_ids)
