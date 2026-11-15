@@ -141,3 +141,8 @@ python3 bench/verify.py
 - sliding window を持つモデルも full attention として計算します（学習時の窓は超えられません）
 - 8 GB のカードでは 7B が上限です。14B 以上は載りません
 - 量子化は学習不要な方式のみで、GPTQ や AWQ のような復元計算は行いません
+
+## ライセンス
+
+AGPL-3.0-or-later です（全文は [LICENSE](LICENSE)）。
+ネットワーク越しにサービスとして提供する場合も、改変版のソース公開が求められます。
