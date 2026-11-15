@@ -113,8 +113,13 @@ class QuantLinear:
         packed = torch.cat(packed_parts, dim=0).contiguous()
         scales = torch.cat(scale_parts, dim=0).contiguous()
         del packed_parts, scale_parts
-        return cls(packed, scales, bias.half().contiguous() if bias is not None else None,
-                   n, k, group, kind, dtype=torch.float16)
+        out = cls(packed, scales, bias.half().contiguous() if bias is not None else None,
+                  n, k, group, kind, dtype=torch.float16)
+        import os as _os
+
+        if kind == "int4" and _os.environ.get("KAZE_INT4_TM") == "1" and n * k >= (1 << 20):
+            out.make_tile_major_copy()
+        return out
 
     def make_tile_major_copy(self) -> None:
         """decode 用に [K/G, N, G/2] の複製を作る（2-D の重みは prefill 用に残す）。"""
