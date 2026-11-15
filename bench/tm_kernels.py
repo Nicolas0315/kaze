@@ -115,6 +115,6 @@ def tm_gemm_swiglu(A, WQ, SC, Y, M, NH, K, BLOCK_M: tl.constexpr,
 
 
 
-prefill 用の tm_gemm / tm_gemm_swiglu は速度が同等（-1〜+2%）だが、
-数値の検証が済んでいない（比較テストで nan が出ており原因は未特定）。
-decode 用の tm_gemv / tm_swiglu は cos 0.999512 以上で検証済み。
+# prefill 用の tm_gemm / tm_gemm_swiglu は速度が同等（-1〜+2%）だが、
+# 数値の検証が済んでいない（比較テストで nan が出ており原因は未特定）。
+# decode 用の tm_gemv / tm_swiglu は cos 0.999512 以上で検証済み。
