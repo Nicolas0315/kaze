@@ -127,6 +127,15 @@ class QuantLinear:
         """decode 用に [K/G, N, G/2] の複製を作る（2-D の重みは prefill 用に残す）。"""
         if self.kind != "int4" or self.packed.dim() != 2:
             return
+        # 空き VRAM が足りない層はあきらめる（部分的に効かせる。残りは従来経路）
+        try:
+            import torch as _t
+
+            free, _ = _t.cuda.mem_get_info()
+            if free < self.packed.numel() * 2 + (512 << 20):
+                return
+        except Exception:
+            pass
         g = self.group
         n, half = self.packed.shape
         blocks = self.k // g
