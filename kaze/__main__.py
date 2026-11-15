@@ -24,7 +24,7 @@ def _maybe_qwen38(args) -> bool:
 
     from transformers import AutoTokenizer
 
-    from kaze.qwen38 import generate, load_qwen38
+    from kaze.qwen38 import generate, generate_graph, load_qwen38
 
     try:
         tok = AutoTokenizer.from_pretrained(path)
@@ -81,6 +81,8 @@ def main() -> None:
     g.add_argument("--max-tokens", type=int, default=128)
     g.add_argument("--temperature", type=float, default=0.0)
     g.add_argument("--chat", action="store_true")
+    g.add_argument("--graph", action="store_true",
+                   help="CUDA Graph で decode を固める（Qwen3.8 系のみ）")
 
     b = sub.add_parser("bench")
     common(b)

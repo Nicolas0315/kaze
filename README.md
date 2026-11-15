@@ -7,8 +7,8 @@ PyTorch はテンソル管理と重みの読み込みにだけ使い、計算は
 qk-norm に対応しています）。重みは safetensors と旧形式の .bin の両方を読みます。
 
 Qwen3.8 系（full attention と線形注意が混ざる hybrid 構成）にも対応しています。重みは int8/int4 に
-量子化でき、KV キャッシュと再帰状態キャッシュも持っています。ただし decode のカーネル起動が
-多いため、dense モデルほど速くはありません（詳しくは docs/evidence.md）。
+量子化でき、KV キャッシュと再帰状態キャッシュも持っています。decode は CUDA Graph に固められるので
+（`--graph`）、1 演算ずつ投げる場合の 5.7 倍で進みます（詳しくは docs/evidence.md）。
 
 ## できること
 

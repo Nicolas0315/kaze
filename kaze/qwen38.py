@@ -85,6 +85,35 @@ def delta_rule(q, k, v, g, beta, chunk_size: int = 64, initial_state=None,
     return recurrent_delta_rule(q, k, v, g, beta, initial_state, return_state)
 
 
+class StaticCache:
+    """CUDA Graph 用の固定長キャッシュ。位置はテンソルで持つので、グラフ内で進められる。"""
+
+    def __init__(self, cfg, max_len: int, batch: int = 1, device="cuda",
+                 dtype=torch.float16):
+        n = int(cfg.num_hidden_layers)
+        self.max_len = max_len
+        self.k = [None] * n
+        self.v = [None] * n
+        self.state = [None] * n
+        self.conv = [None] * n
+        conv_dim = (2 * cfg.linear_num_key_heads * cfg.linear_key_head_dim
+                    + cfg.linear_num_value_heads * cfg.linear_value_head_dim)
+        ksz = int(cfg.linear_conv_kernel_dim)
+        for i, lt in enumerate(cfg.layer_types):
+            if lt == "full_attention":
+                self.k[i] = torch.zeros(batch, cfg.num_key_value_heads, max_len,
+                                        cfg.head_dim, dtype=dtype, device=device)
+                self.v[i] = torch.zeros_like(self.k[i])
+            else:
+                self.state[i] = torch.zeros(batch, cfg.linear_num_value_heads,
+                                            cfg.linear_key_head_dim,
+                                            cfg.linear_value_head_dim,
+                                            dtype=torch.float32, device=device)
+                self.conv[i] = torch.zeros(batch, conv_dim, max(ksz - 1, 1),
+                                           dtype=dtype, device=device)
+        self.pos = torch.zeros(1, dtype=torch.long, device=device)
+
+
 class QLinear:
     """重みを int8/int4 に量子化して、エンジン本体の Triton カーネルで積む層。"""
 
@@ -183,6 +212,21 @@ class FullAttention:
             q = torch.cat([q[..., :rd] * c + rotate_half(q[..., :rd]) * s, q[..., rd:]], -1)
             k = torch.cat([k[..., :rd] * c + rotate_half(k[..., :rd]) * s, k[..., rd:]], -1)
         q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+        if cache is not None and getattr(cache, "max_len", None) and layer is not None:
+            # 固定長バッファに書き、全長に対してマスク付きで注意する（グラフ化できる形）
+            ks, vs = cache.k[layer], cache.v[layer]
+            step = torch.arange(t, device=q.device)
+            ks.index_copy_(2, cache.pos + step, k)
+            vs.index_copy_(2, cache.pos + step, v)
+            qi = (cache.pos + step)[:, None]
+            ki = torch.arange(cache.max_len, device=q.device)[None, :]
+            mask = ki <= qi
+            out = F.scaled_dot_product_attention(q, ks, vs, attn_mask=mask,
+                                                 scale=self.scale,
+                                                 enable_gqa=self.nh != self.nkv)
+            out = out.transpose(1, 2).reshape(b, t, self.nh * self.hd)
+            gate = torch.sigmoid(gate.reshape(b, t, -1))
+            return self.o((out * gate.float()).to(x.dtype))
         past = 0
         if cache is not None and layer is not None:
             if cache.k[layer] is not None:
@@ -234,9 +278,14 @@ class GatedDeltaNet:
         seq = torch.cat([q, k, v], -1).transpose(1, 2)
         w = self.conv_w.squeeze(1)
         ksz = w.shape[-1]
-        if cache is not None and layer is not None and cache.conv[layer] is not None:
+        fixed = cache is not None and getattr(cache, "max_len", None) and layer is not None
+        if fixed:
+            hist = cache.conv[layer]
+            seq = torch.cat([hist, seq], dim=2)
+            hist.copy_(seq[:, :, -(ksz - 1):]) if ksz > 1 else None
+        elif cache is not None and layer is not None and cache.conv[layer] is not None:
             seq = torch.cat([cache.conv[layer], seq], dim=2)
-        if cache is not None and layer is not None:
+        if cache is not None and layer is not None and not fixed:
             cache.conv[layer] = seq[:, :, -(ksz - 1):].detach() if ksz > 1 else None
         pad = F.pad(seq, (ksz - 1, 0))
         # 履歴を前置きした場合は、末尾 t 個の出力に対応する窓を使う
@@ -253,11 +302,15 @@ class GatedDeltaNet:
         q = q.float()
         k = k.float()
         v = v.float()
-        state = cache.state[layer] if (cache is not None and layer is not None) else None
+        state = None
+        if cache is not None and layer is not None:
+            state = cache.state[layer]
         out, new_state = delta_rule(q, k, v, decay, beta, self.chunk_size,
                                     initial_state=state, return_state=True)
-        if cache is not None and layer is not None:
-            cache.state[layer] = new_state.detach()
+        if state is not None and new_state is not None:
+            state.copy_(new_state)          # 固定長バッファに書き戻す（グラフ化できる形）
+        elif cache is not None and layer is not None:
+            cache.state[layer] = new_state.detach()   # 動的キャッシュは差し替え
         v_ = out.pow(2).mean(-1, keepdim=True)
         out = rms_norm(out, self.norm_w, self.eps, plus_one=False).float()
         out = out * F.silu(z.reshape(b, t, self.nv, self.hv).float())
@@ -287,13 +340,20 @@ class Qwen38Model:
     def new_cache(self, batch: int = 1) -> Qwen38Cache:
         return Qwen38Cache(self.cfg, batch, self.device)
 
+    def step(self, ids: torch.Tensor, cache) -> torch.Tensor:
+        # 固定長キャッシュで 1 チャンク進める（CUDA Graph のキャプチャ対象）
+        return self(ids, cache)
+
     def __call__(self, ids: torch.Tensor, cache: "Qwen38Cache | None" = None,
                  start_pos: int = 0) -> torch.Tensor:
         ids = ids.view(-1)
         t = ids.numel()
         x = self.embed[ids].unsqueeze(0)
         rd = int(self.cfg.head_dim * self.cfg.partial_rotary_factor)
-        positions = torch.arange(start_pos, start_pos + t, device=x.device)
+        if cache is not None and getattr(cache, "max_len", None):
+            positions = cache.pos + torch.arange(t, device=x.device)
+        else:
+            positions = torch.arange(start_pos, start_pos + t, device=x.device)
         cos, sin = rope_tables(positions, rd, self.cfg.rope_theta, x.dtype)
         cos, sin = cos[None], sin[None]
         for i, (lt, mixer, mlp, ln1, ln2) in enumerate(self.layers):
@@ -303,7 +363,10 @@ class Qwen38Model:
             x = x + mix
             x = x + mlp(rms_norm(x, ln2, self.cfg.rms_norm_eps))
         if cache is not None:
-            cache.len = start_pos + t
+            if getattr(cache, "max_len", None):
+                cache.pos += t          # 位置の前進は 1 ステップ 1 回
+            else:
+                cache.len = start_pos + t
         x = rms_norm(x, self.norm_w, self.cfg.rms_norm_eps)
         return self.head(x)[:, -1]
 
@@ -402,4 +465,61 @@ def generate(model: Qwen38Model, ids, max_tokens: int = 32, temperature: float =
             logits = model(torch.tensor([nxt], dtype=torch.long, device=dev), cache, cache.len)[0]
         else:
             logits = model(torch.tensor(seq, dtype=torch.long, device=dev))[0]
+    return out
+
+
+class GraphDecoder:
+    """1 トークン decode を CUDA Graph に固めて投げる。"""
+
+    def __init__(self, model: "Qwen38Model", max_len: int = 2048):
+        self.model = model
+        self.cache = StaticCache(model.cfg, max_len, device=model.device,
+                                 dtype=torch.float16)
+        self.ids = torch.zeros(1, dtype=torch.long, device=model.device)
+        # 暖機（カーネルのコンパイルと作業領域の確保）
+        side = torch.cuda.Stream()
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            for _ in range(3):
+                self.model(self.ids, self.cache)
+        torch.cuda.current_stream().wait_stream(side)
+        torch.cuda.synchronize()
+        self._reset()
+        self.graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(self.graph):
+            self.logits = self.model(self.ids, self.cache)
+        self._reset()
+
+    def _reset(self):
+        c = self.cache
+        for buf in (c.k, c.v, c.conv, c.state):
+            for item in buf:
+                if item is not None:
+                    item.zero_()
+        c.pos.zero_()
+
+    def prefill(self, ids) -> torch.Tensor:
+        out = self.model(torch.tensor(list(ids), dtype=torch.long, device=self.ids.device),
+                         self.cache)
+        return out[0]
+
+    def decode(self, token: int) -> torch.Tensor:
+        self.ids[0] = token
+        self.graph.replay()
+        return self.logits[0]
+
+
+def generate_graph(model: "Qwen38Model", ids, max_tokens: int = 64, max_len: int = 2048,
+                   eos_token_ids=()) -> list[int]:
+    """CUDA Graph 版の貪欲生成。"""
+    dec = GraphDecoder(model, max_len=max_len)
+    logits = dec.prefill(ids)
+    out: list[int] = []
+    stop = set(eos_token_ids)
+    for _ in range(max_tokens):
+        nxt = int(logits.argmax().item())
+        out.append(nxt)
+        if nxt in stop:
+            break
+        logits = dec.decode(nxt)
     return out

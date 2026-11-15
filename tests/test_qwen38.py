@@ -163,6 +163,32 @@ def check_vlm_keys() -> bool:
     return cos > 0.999
 
 
+
+
+def check_graph() -> bool:
+    """CUDA Graph 版の decode が素の生成と同じ結果になるか。"""
+    if not torch.cuda.is_available():
+        print("graph: skip (cuda not available)")
+        return True
+    from transformers import AutoModelForCausalLM, Qwen3_5TextConfig
+
+    from kaze.qwen38 import generate, generate_graph
+
+    raw = dict(BASE, hidden_size=128, intermediate_size=256, num_attention_heads=4,
+               num_key_value_heads=2, head_dim=32, max_position_embeddings=256,
+               layer_types=LAYER_TYPES[:2], num_hidden_layers=2)
+    torch.manual_seed(0)
+    ref = AutoModelForCausalLM.from_config(Qwen3_5TextConfig(**raw),
+                                          dtype=torch.float32).eval()
+    sd = {k: v.detach() for k, v in ref.state_dict().items()}
+    model = Qwen38Model(Qwen38Config(raw), sd, dtype=torch.float16, device="cuda")
+    ids = [5, 12, 33, 7, 91]
+    a = generate(model, ids, max_tokens=8)
+    b = generate_graph(model, ids, max_tokens=8, max_len=128)
+    print("graph: 同一 %s" % (a == b))
+    return a == b
+
+
 def main() -> int:
     try:
         from transformers import AutoModelForCausalLM, Qwen3_5TextConfig
@@ -189,7 +215,8 @@ def main() -> int:
     diff = (want - got).abs().max().item()
     print("hybrid 4層（線形2 + full2）: cos %.6f  maxdiff %.6f" % (cos, diff))
     ok = (cos > 0.999 and check_load_and_generate() and check_cache()
-          and check_quantised() and check_vlm_keys())
+          and check_quantised() and check_vlm_keys()
+          and check_graph())
     print("ok" if ok else "FAIL")
     return 0 if ok else 1
 
