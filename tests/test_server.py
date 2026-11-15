@@ -10,6 +10,7 @@ import subprocess
 import os
 import sys
 import time
+import urllib.error
 import urllib.request
 
 sys.path.insert(0, ".")
@@ -74,6 +75,43 @@ def main() -> int:
         print(f"streaming     {chunks} chunks {'ok' if ok else 'FAIL'}")
         if not ok:
             fails.append("stream")
+        # 異常系: 壊れた JSON は 400 で返り、サーバは落ちない
+        bad = urllib.request.Request(
+            f"http://127.0.0.1:{PORT}/v1/completions", b"{not json",
+            {"Content-Type": "application/json"})
+        try:
+            urllib.request.urlopen(bad, timeout=15)
+            code = 200
+        except urllib.error.HTTPError as exc:
+            code = exc.code
+        ok = code == 400
+        print(f"bad json      {code} {'ok' if ok else 'FAIL'}")
+        if not ok:
+            fails.append("bad json")
+
+        # 異常系: 存在しないパスは 404
+        try:
+            urllib.request.urlopen(f"http://127.0.0.1:{PORT}/v1/nope", timeout=15)
+            code = 200
+        except urllib.error.HTTPError as exc:
+            code = exc.code
+        ok = code == 404
+        print(f"unknown path  {code} {'ok' if ok else 'FAIL'}")
+        if not ok:
+            fails.append("unknown path")
+
+        # 異常系: 過大な max_tokens は 4xx で弾く
+        try:
+            post("/v1/completions", {"model": "kaze", "prompt": "hi",
+                                     "max_tokens": 10**6})
+            code = 200
+        except urllib.error.HTTPError as exc:
+            code = exc.code
+        ok = 400 <= code < 500
+        print(f"huge tokens   {code} {'ok' if ok else 'FAIL'}")
+        if not ok:
+            fails.append("huge tokens")
+
     finally:
         proc.terminate()
         try:
