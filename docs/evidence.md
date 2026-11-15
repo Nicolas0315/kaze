@@ -466,3 +466,19 @@ Colab のシークレットは UI からしか読めないため、CLI 経由で
 Colab CLI では `--env LD_LIBRARY_PATH=...` を exec に渡す必要があります（次回の手順）。
 
 なお Kaze 側の 27B は **20.6 / 21.0 tok/s** と 2 回再現しており、こちらの数字は確定しています。
+
+#### 27B の llama.cpp 比較: Colab カーネルでは不可（round 31・打ち切り）
+
+4 回目の試行として、`colab exec --env LD_LIBRARY_PATH=...` で起動時に渡しましたが、
+**すでに走っているカーネルには環境変数が伝わりません**でした（`--env` は新規カーネル向け）。
+
+これで 27B の A/B は次の 4 通りで止まったことになります。
+
+1. GGUF ダウンロードが HTTP 429（未認証の帯域制限）
+2. `libcudart.so.12` 不在（Colab の torch は CUDA 13）
+3. Python 内での `LD_LIBRARY_PATH` 設定は無効（`ctypes.CDLL` は起動時の探索パスを使う）
+4. `colab exec --env` は既存カーネルに効かない
+
+**Kaze 側の 27B は 20.6 / 21.0 tok/s で 2 回再現しており、こちらは確定**です。
+27B の相対比較が要る場合は、Colab の UI から（シークレットと LD_LIBRARY_PATH が使える環境で）
+`bench/compare_llamacpp.py` を回すのが確実です。
