@@ -99,6 +99,8 @@ def main() -> None:
 
     s = sub.add_parser("serve")
     common(s)
+    s.add_argument("--graph", action="store_true",
+                   help="CUDA Graph で decode を固める（Qwen3.8 系のみ）")
     s.add_argument("--host", default="0.0.0.0")
     s.add_argument("--port", type=int, default=8000)
 
