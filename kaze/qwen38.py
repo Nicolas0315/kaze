@@ -98,6 +98,17 @@ def delta_rule(q, k, v, g, beta, chunk_size: int = 64, initial_state=None,
     return recurrent_delta_rule(q, k, v, g, beta, initial_state, return_state)
 
 
+class FusedLinear:
+    """複数の線形層を 1 枚の重みにまとめて、1 回の積で全部出す。"""
+
+    def __init__(self, weights: list[torch.Tensor], kind: str, group: int, device, dtype):
+        self.sizes = [w.shape[0] for w in weights]
+        self.inner = linear(torch.cat(weights, dim=0), kind, group, device, dtype)
+
+    def __call__(self, x: torch.Tensor) -> list[torch.Tensor]:
+        return list(torch.split(self.inner(x), self.sizes, dim=-1))
+
+
 class StaticCache:
     """CUDA Graph 用の固定長キャッシュ。位置はテンソルで持つので、グラフ内で進められる。"""
 
