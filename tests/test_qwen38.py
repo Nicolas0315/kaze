@@ -89,6 +89,37 @@ def check_cache() -> bool:
     return diff < 1e-4 and same_tokens
 
 
+
+
+def check_quantised() -> bool:
+    """int8/int4 に量子化しても参照と近い logits が出るか（GPU）。"""
+    from transformers import AutoModelForCausalLM, Qwen3_5TextConfig
+
+    if not torch.cuda.is_available():
+        print("quantised: skip (cuda not available)")
+        return True
+    raw = dict(BASE, layer_types=LAYER_TYPES)
+    torch.manual_seed(0)
+    ref = AutoModelForCausalLM.from_config(Qwen3_5TextConfig(**raw),
+                                          dtype=torch.float32).eval()
+    sd = {k: v.detach().float() for k, v in ref.state_dict().items()}
+    ids = torch.tensor([5, 12, 33, 7, 91, 2, 44])
+    with torch.no_grad():
+        want = ref(ids[None, :]).logits[0, -1].cuda()
+    ok = True
+    for kind, thr in (("int8", 0.99), ("int4", 0.9)):
+        model = Qwen38Model(Qwen38Config(raw), sd, dtype=torch.float16,
+                            device="cuda", kind=kind)
+        got = model(ids.cuda()).flatten()
+        cos = torch.nn.functional.cosine_similarity(want, got, dim=0).item()
+        mem = torch.cuda.memory_allocated() / 1e9
+        print("quantised %-4s cos %.6f  %.2f GB" % (kind, cos, mem))
+        ok = ok and cos > thr
+        del model
+        torch.cuda.empty_cache()
+    return ok
+
+
 def main() -> int:
     try:
         from transformers import AutoModelForCausalLM, Qwen3_5TextConfig
@@ -114,7 +145,8 @@ def main() -> int:
     cos = torch.nn.functional.cosine_similarity(want, got, dim=0).item()
     diff = (want - got).abs().max().item()
     print("hybrid 4層（線形2 + full2）: cos %.6f  maxdiff %.6f" % (cos, diff))
-    ok = cos > 0.999 and check_load_and_generate() and check_cache()
+    ok = (cos > 0.999 and check_load_and_generate() and check_cache()
+          and check_quantised())
     print("ok" if ok else "FAIL")
     return 0 if ok else 1
 

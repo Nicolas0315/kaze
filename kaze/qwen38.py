@@ -73,6 +73,9 @@ _CHUNK_RULE = _reference_chunk_rule()
 
 def delta_rule(q, k, v, g, beta, chunk_size: int = 64, initial_state=None,
                return_state: bool = False):
+    # decode（1〜数トークン）は chunk に詰めると無駄が多いので逐次で回す
+    if q.shape[1] <= 8:
+        return recurrent_delta_rule(q, k, v, g, beta, initial_state, return_state)
     if _CHUNK_RULE is not None:
         out, st = _CHUNK_RULE(q, k, v, g, beta, chunk_size=chunk_size,
                               initial_state=initial_state,
@@ -80,6 +83,51 @@ def delta_rule(q, k, v, g, beta, chunk_size: int = 64, initial_state=None,
                               use_qk_l2norm_in_kernel=True)
         return (out, st) if return_state else out
     return recurrent_delta_rule(q, k, v, g, beta, initial_state, return_state)
+
+
+class QLinear:
+    """重みを int8/int4 に量子化して、エンジン本体の Triton カーネルで積む層。"""
+
+    def __init__(self, w: torch.Tensor, kind: str, group: int, device, dtype):
+        from kaze.quant import QuantLinear
+
+        self.kind = kind
+        self.lin = QuantLinear.from_float(w.to(device), None, kind=kind, group=group)
+        self.n, self.k = w.shape
+
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        import kaze.kernels.quant_linear as K
+
+        shape = x.shape[:-1]
+        rows = 1
+        for s in shape:
+            rows *= s
+        flat = x.reshape(rows, self.k).contiguous()
+        if rows == 1:
+            # gemv は tdim 行を前提に読むので、1 行でも 16 行に詰めてから渡す
+            pad = torch.zeros((16, self.k), dtype=flat.dtype, device=flat.device)
+            pad[0].copy_(flat[0])
+            out = K.gemv(pad, self.lin, 16)[:1]
+        else:
+            out = K.gemm(flat, self.lin)
+        return out.reshape(*shape, self.n)
+
+
+def linear(w: torch.Tensor, kind: str, group: int, device, dtype):
+    """kind が int8/int4 なら量子化し、そうでなければ普通の線形層として返す。"""
+    if kind in ("int8", "int4", "mixed"):
+        return QLinear(w, "int8" if kind == "mixed" else kind, group, device, dtype)
+    return Dense(w, dtype, device)
+
+
+class Dense:
+    """量子化しない普通の線形層（小さい行列や fp16 用）。"""
+
+    def __init__(self, w: torch.Tensor, dtype, device):
+        self.w = w.to(device=device, dtype=dtype)
+
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        return x @ self.w.T
 
 
 class Qwen38Cache:
@@ -97,21 +145,23 @@ class Qwen38Cache:
 
 
 class Mlp:
-    def __init__(self, prefix: str, sd: dict, dtype, device):
-        g = lambda n: sd[f"{prefix}.{n}"].to(device=device, dtype=dtype)
-        self.gate, self.up, self.down = g("gate_proj.weight"), g("up_proj.weight"), g("down_proj.weight")
+    def __init__(self, prefix: str, sd: dict, dtype, device, kind="fp16", group=128):
+        get = lambda n: linear(sd[f"{prefix}.{n}"], kind, group, device, dtype)
+        self.gate, self.up, self.down = (get("gate_proj.weight"), get("up_proj.weight"),
+                                         get("down_proj.weight"))
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
-        return (F.silu(x @ self.gate.T) * (x @ self.up.T)) @ self.down.T
+        return self.down(F.silu(self.gate(x)) * self.up(x))
 
 
 class FullAttention:
     """full attention 層。q_proj は出力ゲートと半分ずつに分かれる。"""
 
-    def __init__(self, cfg, prefix: str, sd: dict, dtype, device):
+    def __init__(self, cfg, prefix: str, sd: dict, dtype, device, kind="fp16", group=128):
+        q = lambda n: linear(sd[f"{prefix}.{n}"], kind, group, device, dtype)
+        self.q, self.k, self.v, self.o = (q("q_proj.weight"), q("k_proj.weight"),
+                                          q("v_proj.weight"), q("o_proj.weight"))
         g = lambda n: sd[f"{prefix}.{n}"].to(device=device, dtype=dtype)
-        self.q, self.k, self.v, self.o = (g("q_proj.weight"), g("k_proj.weight"),
-                                          g("v_proj.weight"), g("o_proj.weight"))
         self.qn, self.kn = g("q_norm.weight"), g("k_norm.weight")
         self.nh, self.nkv, self.hd = cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim
         self.rope_dim = int(self.hd * cfg.partial_rotary_factor)
@@ -120,11 +170,11 @@ class FullAttention:
 
     def __call__(self, x, cos, sin, cache=None, layer: int | None = None):
         b, t, _ = x.shape
-        qg = (x @ self.q.T).view(b, t, self.nh, self.hd * 2)
+        qg = self.q(x).view(b, t, self.nh, self.hd * 2)
         q, gate = qg.chunk(2, dim=-1)
         q = rms_norm(q, self.qn, self.eps)
-        k = rms_norm((x @ self.k.T).view(b, t, self.nkv, self.hd), self.kn, self.eps)
-        v = (x @ self.v.T).view(b, t, self.nkv, self.hd)
+        k = rms_norm(self.k(x).view(b, t, self.nkv, self.hd), self.kn, self.eps)
+        v = self.v(x).view(b, t, self.nkv, self.hd)
         c, s, rd = cos[:, :, None, :], sin[:, :, None, :], self.rope_dim
         if rd < self.hd:
             q = torch.cat([q[..., :rd] * c + rotate_half(q[..., :rd]) * s, q[..., rd:]], -1)
@@ -149,20 +199,22 @@ class FullAttention:
                                                  enable_gqa=self.nh != self.nkv)
         out = out.transpose(1, 2).reshape(b, t, self.nh * self.hd)
         gate = torch.sigmoid(gate.reshape(b, t, -1))
-        return (out * gate.float()).to(x.dtype) @ self.o.T
+        return self.o((out * gate.float()).to(x.dtype))
 
 
 class GatedDeltaNet:
     """線形注意層（gated delta rule）。再帰状態と conv 履歴をキャッシュできる。"""
 
-    def __init__(self, cfg, prefix: str, sd: dict, dtype, device):
+    def __init__(self, cfg, prefix: str, sd: dict, dtype, device, kind="fp16", group=128):
         g = lambda n: sd[f"{prefix}.{n}"].to(device=device, dtype=dtype)
-        self.qkv, self.z = g("in_proj_qkv.weight"), g("in_proj_z.weight")
+        q = lambda n: linear(sd[f"{prefix}.{n}"], kind, group, device, dtype)
+        self.qkv, self.z = q("in_proj_qkv.weight"), q("in_proj_z.weight")
         self.b_w, self.a_w = g("in_proj_b.weight"), g("in_proj_a.weight")
         self.conv_w = g("conv1d.weight")
         self.A_log = sd[f"{prefix}.A_log"].to(device=device, dtype=torch.float32)
         self.dt_bias = sd[f"{prefix}.dt_bias"].to(device=device, dtype=torch.float32)
-        self.norm_w, self.out = g("norm.weight"), g("out_proj.weight")
+        self.norm_w = g("norm.weight")
+        self.out = q("out_proj.weight")
         self.nk, self.nv = cfg.linear_num_key_heads, cfg.linear_num_value_heads
         self.hk, self.hv = cfg.linear_key_head_dim, cfg.linear_value_head_dim
         self.eps = cfg.rms_norm_eps
@@ -171,8 +223,8 @@ class GatedDeltaNet:
 
     def __call__(self, x: torch.Tensor, cache=None, layer: int | None = None) -> torch.Tensor:
         b, t, _ = x.shape
-        q, k, v = torch.split(x @ self.qkv.T, [self.kdim, self.kdim, self.vdim], dim=-1)
-        z = x @ self.z.T
+        q, k, v = torch.split(self.qkv(x), [self.kdim, self.kdim, self.vdim], dim=-1)
+        z = self.z(x)
         beta = torch.sigmoid(x @ self.b_w.T)
         a = x @ self.a_w.T
         # depthwise 因果 conv（活性 silu）。キャッシュがあれば直前の入力を前置きする
@@ -207,23 +259,25 @@ class GatedDeltaNet:
         out = rms_norm(out, self.norm_w, self.eps, plus_one=False).float()
         out = out * F.silu(z.reshape(b, t, self.nv, self.hv).float())
         out = out.reshape(b, t, self.vdim).to(x.dtype)
-        return out @ self.out.T
+        return self.out(out)
 
 
 class Qwen38Model:
     """Qwen3.8（text）の本体。"""
 
-    def __init__(self, cfg, sd: dict, dtype=torch.float16, device="cuda"):
+    def __init__(self, cfg, sd: dict, dtype=torch.float16, device="cuda",
+                 kind: str = "fp16", group: int = 128):
         self.cfg, self.device = cfg, device
         self.embed = sd["model.embed_tokens.weight"].to(device=device, dtype=dtype)
         self.norm_w = sd["model.norm.weight"].to(device=device, dtype=dtype)
-        self.head = sd["lm_head.weight"].to(device=device, dtype=dtype)
+        self.head = linear(sd["lm_head.weight"], kind, group, device, dtype)
         self.layers = []
         for i, lt in enumerate(cfg.layer_types):
             p = f"model.layers.{i}"
-            mixer = (GatedDeltaNet(cfg, p + ".linear_attn", sd, dtype, device) if lt == "linear_attention"
-                     else FullAttention(cfg, p + ".self_attn", sd, dtype, device))
-            self.layers.append((lt, mixer, Mlp(p + ".mlp", sd, dtype, device),
+            mixer = (GatedDeltaNet(cfg, p + ".linear_attn", sd, dtype, device, kind, group)
+                     if lt == "linear_attention"
+                     else FullAttention(cfg, p + ".self_attn", sd, dtype, device, kind, group))
+            self.layers.append((lt, mixer, Mlp(p + ".mlp", sd, dtype, device, kind, group),
                                 sd[p + ".input_layernorm.weight"].to(device=device, dtype=dtype),
                                 sd[p + ".post_attention_layernorm.weight"].to(device=device, dtype=dtype)))
 
@@ -248,7 +302,7 @@ class Qwen38Model:
         if cache is not None:
             cache.len = start_pos + t
         x = rms_norm(x, self.norm_w, self.cfg.rms_norm_eps)
-        return (x @ self.head.T)[:, -1]
+        return self.head(x)[:, -1]
 
 
 class Qwen38Config:
@@ -274,7 +328,8 @@ class Qwen38Config:
         return cls(cfg.get("text_config", cfg))
 
 
-def load_qwen38(path: str, dtype=None, device: str | None = None):
+def load_qwen38(path: str, dtype=None, device: str | None = None,
+                 kind: str = "fp16", group: int = 128):
     # safetensors を全部読んで text モデルを組み立てる
     import glob
     import os
