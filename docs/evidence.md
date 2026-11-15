@@ -404,3 +404,22 @@ Triton カーネルにしました（`kaze/kernels/delta.py`）。ヘッド × v
 このマシンには CUDA 12 のランタイムが無いため、llama-cpp-python の cu124 ホイールが
 ロードできません（`libcudart.so.12` 不在）。CUDA 13 向けにビルドし直すか、
 CUDA 12 のランタイムを入れる必要があります。手元での A/B はここが上限です。
+
+### llama.cpp との同一条件比較（round 15・実測）
+
+同じ GPU・同じプロトコル（プロンプト 48 + 128 生成、greedy）で、続けて測りました。
+
+| エンジン | モデル | decode |
+|---|---|---|
+| llama.cpp（llama-cpp-python 0.3.36, cu124） | Qwen2.5-3B Instruct Q4_K_M | 149.1 tok/s |
+| **Kaze** | Qwen2.5-3B Instruct int4（group 128） | **158.0 tok/s** |
+
+**Kaze が 6% 速い**という結果です。量子化の形式が違う（Q4_K_M と group 128 の int4）ので
+厳密な同一条件ではありませんが、同じ GPU で同じ長さを生成した実測値です。
+
+llama.cpp 側は `timings` が返らなかったため、生成長 16 と 128 の所要時間の差から
+1 トークンあたりを出しています（プロンプト評価の分を差し引くため）。
+
+このマシンで llama.cpp を動かすには、CUDA 12 のランタイムが要ります
+（`pip install nvidia-cuda-runtime-cu12 nvidia-cublas-cu12` して `LD_LIBRARY_PATH` を通す）。
+8GB のカードでは 2 つ同時に載らないので、llama.cpp → 解放 → Kaze の順に測ります。

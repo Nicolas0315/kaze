@@ -51,15 +51,24 @@ def bench_llamacpp() -> dict:
     if not GGUF or not os.path.isfile(GGUF):
         return {"engine": "llama.cpp", "error": "KAZE_GGUF を指定してください"}
     llm = Llama(model_path=GGUF, n_gpu_layers=-1, n_ctx=2048, verbose=False)
-    llm(prompt_text(PROMPT_TOKENS), max_tokens=8)
-    out = llm(prompt_text(PROMPT_TOKENS), max_tokens=GEN_TOKENS, temperature=0)
-    t = out["timings"]
-    return {"engine": "llama.cpp",
-            "decode_tok_s": t["predicted_per_second"],
-            "prefill_tok_s": t["prompt_per_second"]}
+    prompt = prompt_text(PROMPT_TOKENS)
+    llm(prompt, max_tokens=8)
+    # timings はバージョンによって入っていないので、長さを変えた 2 回の差から decode 速度を出す
+    times = {}
+    for n in (16, GEN_TOKENS):
+        t0 = time.perf_counter()
+        llm(prompt, max_tokens=n, temperature=0)
+        times[n] = time.perf_counter() - t0
+    decode = (GEN_TOKENS - 16) / max(times[GEN_TOKENS] - times[16], 1e-9)
+    del llm
+    import gc
+
+    gc.collect()
+    return {"engine": "llama.cpp", "decode_tok_s": decode}
 
 
 if __name__ == "__main__":
-    rows = [bench_kaze(), bench_llamacpp()]
+    # 8GB のカードでは 2 つ同時に載らないので、先に llama.cpp を測って解放する
+    rows = [bench_llamacpp(), bench_kaze()]
     for row in rows:
         print(json.dumps(row, ensure_ascii=False))
