@@ -779,3 +779,12 @@ round 49 では +3.2% でしたが、あのときは KV が 8 ブロックしか
 静かな環境の基準値（7B 69.9 tok/s）に当てはめると約 72.6 tok/s。
 7B は重みが大きく複製の余地が小さいため伸びは限定的ですが、出力は変わらず、
 メモリが足りない環境でも安全に使えます。
+
+#### 全テスト通過（round 77・bd1901a 時点）
+
+| スイート | 結果 |
+|---|---|
+| tests/test_kaze.py | **19/19 passed** |
+| tests/test_llm.py | **5/5 passed** |
+| tests/test_qwen38.py | **ok** |
+| tests/test_server.py | 全項目 ok（stop・同時4接続・異常系を含む） |
