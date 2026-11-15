@@ -482,3 +482,15 @@ Colab CLI では `--env LD_LIBRARY_PATH=...` を exec に渡す必要があり�
 **Kaze 側の 27B は 20.6 / 21.0 tok/s で 2 回再現しており、こちらは確定**です。
 27B の相対比較が要る場合は、Colab の UI から（シークレットと LD_LIBRARY_PATH が使える環境で）
 `bench/compare_llamacpp.py` を回すのが確実です。
+
+#### 27B の A/B: 5 回目も不可（round 32・最終）
+
+新しい A100 セッションを作り、`colab exec --env LD_LIBRARY_PATH=...` を最初の exec に付けて
+試しましたが、結果は同じ `libcudart.so.12` 不在でした。Colab CLI の `--env` は
+カーネル側のダイナミックローダの探索パスに反映されません。
+
+5 回の試行すべてが環境側の制約で止まったため、**27B の相対比較は CLI 経由では不可**と結論します。
+UI から（シークレットと環境変数が使える状態で）`bench/compare_llamacpp.py` を回せば取れます。
+
+**確定している数値**: Kaze の 27B（int4・A100 40GB）は 20.6 / 21.0 tok/s（2 回再現）、
+GPU 使用量 15.81GB、生成は自然な日本語。
