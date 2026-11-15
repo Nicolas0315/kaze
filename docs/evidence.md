@@ -610,3 +610,23 @@ BN=64 は現行カーネルでも遅い）。揃えて測り直した結果で�
 （`gemm` と `gemv_swiglu` は 2 次元の重みを前提にしているので、そのままでは使えません）。
 効果が大きいのは gate_up（7B の重みの 54%）ですが、そこは `gemv_swiglu` 経由なので、
 **tile-major 版の swiglu カーネルを書く**のが次の作業です。
+
+#### tile-major を活かすには prefill 側のカーネルも要る（round 42）
+
+tile-major は decode の GEMV で +8%（360 GB/s）でしたが、そのままでは導入できません。
+理由は **同じ重みを prefill では `gemm` / `gemm_swiglu` が使う**ためです。
+
+| 用途 | 使うカーネル | tile-major 対応 |
+|---|---|---|
+| decode（1 行） | `gemv` / `gemv_swiglu` | ○（GEMV は検証済み、swiglu は未実装） |
+| prefill（64 行以上） | `gemm` / `gemm_swiglu` | ✗ 2 次元の重み前提 |
+
+重みを tile-major に並べ替えると prefill が壊れるため、導入には **prefill 側の tile-major 版**
+（`gemm` と `gemm_swiglu` の 2 本）も必要です。1 本ずつ検証しながら進める必要があり、
+1 ラウンドでは終わりません。
+
+なお、qkv/o だけに適用する案も成立しません（prefill は qkv も `gemm` で積むため）。
+
+**次の作業者への申し送り**: tile-major の +8% は本物ですが、採るなら 4 本のカーネル
+（gemv・gemv_swiglu・gemm・gemm_swiglu の tile-major 版）を揃える必要があります。
+揃わない状態で一部だけ入れ替えると、prefill が落ちます。
