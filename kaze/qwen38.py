@@ -94,6 +94,7 @@ class QLinear:
         self.kind = kind
         self.lin = QuantLinear.from_float(w.to(device), None, kind=kind, group=group)
         self.n, self.k = w.shape
+        self._pad = None
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         import kaze.kernels.quant_linear as K
@@ -104,10 +105,12 @@ class QLinear:
             rows *= s
         flat = x.reshape(rows, self.k).contiguous()
         if rows == 1:
-            # gemv は tdim 行を前提に読むので、1 行でも 16 行に詰めてから渡す
-            pad = torch.zeros((16, self.k), dtype=flat.dtype, device=flat.device)
-            pad[0].copy_(flat[0])
-            out = K.gemv(pad, self.lin, 16)[:1]
+            # gemv は tdim 行を前提に読むので、1 行でも 16 行に詰めてから渡す。
+            # バッファは使い回す（毎トークン確保すると呼び出し回数ぶん無駄が出る）
+            if self._pad is None or self._pad.device != flat.device:
+                self._pad = torch.zeros((16, self.k), dtype=flat.dtype, device=flat.device)
+            self._pad[0].copy_(flat[0])
+            out = K.gemv(self._pad, self.lin, 16)[:1]
         else:
             out = K.gemm(flat, self.lin)
         return out.reshape(*shape, self.n)
@@ -329,8 +332,13 @@ class Qwen38Config:
 
 
 def load_qwen38(path: str, dtype=None, device: str | None = None,
-                 kind: str = "fp16", group: int = 128):
-    # safetensors を全部読んで text モデルを組み立てる
+                 kind: str = "fp16", group: int = 128, verbose: bool = False):
+    """チェックポイントを読んで text モデルを組み立てる。
+
+    配布物は VLM 形式（`Qwen3_5ForConditionalGeneration`）なので、重みのキーは
+    `model.language_model.*` になっています。text 側だけを取り出して `model.*` に直し、
+    視覚側（`model.visual.*`）や MTP の重みは捨てます。
+    """
     import glob
     import os
 
@@ -340,13 +348,34 @@ def load_qwen38(path: str, dtype=None, device: str | None = None,
     files = sorted(glob.glob(os.path.join(path, "*.safetensors")))
     if not files:
         raise FileNotFoundError(f"no safetensors under {path}")
-    sd = {}
-    for f in files:
-        sd.update(st.load_file(f))
+    if dtype is None:
+        dtype = torch.float16
+    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     cfg = Qwen38Config.load(os.path.join(path, "config.json"))
-    return Qwen38Model(cfg, sd, dtype=dtype or torch.float16,
-                       device=device or ("cuda" if torch.cuda.is_available() else "cpu"))
 
+    sd = {}
+    dropped = 0
+    for f in files:
+        for k, v in st.load_file(f, device="cpu").items():
+            if k.startswith("model.language_model."):
+                k = "model." + k[len("model.language_model."):]
+            elif k.startswith(("model.visual.", "visual.", "mtp.")):
+                dropped += 1
+                continue
+            # 途中で fp16 に落としておくと、55GB のチェックポイントでも RAM が半分で済む
+            sd[k] = v.to(dtype) if v.is_floating_point() else v
+    if "model.embed_tokens.weight" not in sd:
+        head = [k for k in sd if k.endswith("embed_tokens.weight")]
+        raise KeyError(
+            "text 側の重みが見つかりません（model.embed_tokens.weight が無い）。"
+            f" 先頭のキー: {list(sd)[:5]}")
+    if "lm_head.weight" not in sd:
+        sd["lm_head.weight"] = sd["model.embed_tokens.weight"]
+    if verbose:
+        print(f"{len(files)} シャード / {len(sd)} テンソル（視覚側 {dropped} 個を除外）")
+    model = Qwen38Model(cfg, sd, dtype=dtype, device=device, kind=kind, group=group)
+    del sd
+    return model
 
 def generate(model: Qwen38Model, ids, max_tokens: int = 32, temperature: float = 0.0,
              eos_token_ids=(), use_cache: bool = True) -> list[int]:

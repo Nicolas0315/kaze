@@ -120,6 +120,49 @@ def check_quantised() -> bool:
     return ok
 
 
+
+
+def check_vlm_keys() -> bool:
+    """配布物（model.language_model.* ＋視覚側）の形でも読み込めるか。"""
+    import json
+    import os
+    import tempfile
+
+    import safetensors.torch as st
+    from transformers import AutoModelForCausalLM, Qwen3_5TextConfig
+
+    from kaze.qwen38 import load_qwen38
+
+    raw = dict(BASE, layer_types=LAYER_TYPES)
+    torch.manual_seed(0)
+    ref = AutoModelForCausalLM.from_config(Qwen3_5TextConfig(**raw),
+                                          dtype=torch.float32).eval()
+    sd = {k: v.detach() for k, v in ref.state_dict().items()}
+    vlm = {}
+    for k, v in sd.items():
+        if k.startswith("model."):
+            vlm["model.language_model." + k[len("model."):]] = v.clone()
+        else:
+            vlm[k] = v.clone()
+    vlm["model.visual.patch_embed.weight"] = torch.zeros(8, 8)
+    vlm["mtp.fc.weight"] = torch.zeros(4, 4)
+
+    d = tempfile.mkdtemp()
+    items = list(vlm.items())
+    half = len(items) // 2
+    st.save_file(dict(items[:half]), os.path.join(d, "model-00001-of-00002.safetensors"))
+    st.save_file(dict(items[half:]), os.path.join(d, "model-00002-of-00002.safetensors"))
+    with open(os.path.join(d, "config.json"), "w", encoding="utf-8") as f:
+        json.dump(dict(raw, model_type="qwen3_5_text"), f)
+    model = load_qwen38(d, dtype=torch.float32, device="cpu")
+    ids = torch.tensor([5, 12, 33, 7, 91])
+    with torch.no_grad():
+        want = ref(ids[None, :]).logits[0, -1]
+    cos = torch.nn.functional.cosine_similarity(want, model(ids).flatten(), dim=0).item()
+    print("vlm形式のキー: cos %.6f" % cos)
+    return cos > 0.999
+
+
 def main() -> int:
     try:
         from transformers import AutoModelForCausalLM, Qwen3_5TextConfig
@@ -146,7 +189,7 @@ def main() -> int:
     diff = (want - got).abs().max().item()
     print("hybrid 4層（線形2 + full2）: cos %.6f  maxdiff %.6f" % (cos, diff))
     ok = (cos > 0.999 and check_load_and_generate() and check_cache()
-          and check_quantised())
+          and check_quantised() and check_vlm_keys())
     print("ok" if ok else "FAIL")
     return 0 if ok else 1
 
