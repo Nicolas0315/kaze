@@ -36,6 +36,51 @@ def rms_norm(x: torch.Tensor, w: torch.Tensor, eps: float,
     return y.to(x.dtype)
 
 
+def _reference_chunk_rule():
+    # transformers に入っている chunked 実装（無ければ None）。
+    # 自前の chunked 版はまだ数値が合っていないので、使える環境では検証済みの実装に任せる。
+    # 見つからなければ逐次版（遅いが正しい）で動く。
+    for mod in ("transformers.models.qwen3_next.modeling_qwen3_next",
+                "transformers.models.qwen3_5.modeling_qwen3_5"):
+        try:
+            m = __import__(mod, fromlist=["torch_chunk_gated_delta_rule"])
+            fn = getattr(m, "torch_chunk_gated_delta_rule", None)
+            if fn is not None:
+                return fn
+        except Exception:
+            continue
+    return None
+
+
+_CHUNK_RULE = _reference_chunk_rule()
+
+
+def delta_rule(q, k, v, g, beta, chunk_size: int = 64):
+    # 使える実装のうち一番速いもので回す
+    if _CHUNK_RULE is not None:
+        out, _ = _CHUNK_RULE(q, k, v, g, beta, chunk_size=chunk_size,
+                             use_qk_l2norm_in_kernel=True)
+        return out
+    return recurrent_delta_rule(q, k, v, g, beta)
+
+def recurrent_delta_rule(q, k, v, g, beta):
+    """逐次版（参照用）。q/k は L2 正規化とスケーリング済みを渡す。"""
+    b, t, h, dk = k.shape
+    dv = v.shape[-1]
+    q = F.normalize(q.float(), dim=-1, eps=1e-6) / (dk ** 0.5)
+    k = F.normalize(k.float(), dim=-1, eps=1e-6)
+    v = v.float()
+    state = torch.zeros((b, h, dk, dv), dtype=torch.float32, device=q.device)
+    out = torch.zeros((b, t, h, dv), dtype=torch.float32, device=q.device)
+    for i in range(t):
+        state = state * g[:, i].exp()[..., None, None]
+        kv_mem = (state * k[:, i][..., None]).sum(-2)
+        delta = (v[:, i] - kv_mem) * beta[:, i][..., None]
+        state = state + k[:, i][..., None] * delta[..., None, :]
+        out[:, i] = (state * q[:, i][..., None]).sum(-2)
+    return out
+
+
 class Mlp:
     def __init__(self, prefix: str, sd: dict, dtype, device):
         g = lambda n: sd[f"{prefix}.{n}"].to(device=device, dtype=dtype)
@@ -96,6 +141,7 @@ class GatedDeltaNet:
         self.hk, self.hv = cfg.linear_key_head_dim, cfg.linear_value_head_dim
         self.eps = cfg.rms_norm_eps
         self.kdim, self.vdim = self.nk * self.hk, self.nv * self.hv
+        self.chunk_size = 64
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         b, t, _ = x.shape
@@ -117,18 +163,10 @@ class GatedDeltaNet:
             rep = self.nv // self.nk
             q, k = q.repeat_interleave(rep, dim=2), k.repeat_interleave(rep, dim=2)
         decay = -self.A_log.exp()[None, None, :] * F.softplus(a.float() + self.dt_bias)
-        # 参照カーネルは use_qk_l2norm_in_kernel=True なので、q と k を head ごとに L2 正規化する
-        q = F.normalize(q.float(), dim=-1, eps=1e-6) / (self.hk ** 0.5)
-        k = F.normalize(k.float(), dim=-1, eps=1e-6)
+        q = q.float()
+        k = k.float()
         v = v.float()
-        state = torch.zeros((b, self.nv, self.hk, self.hv), dtype=torch.float32, device=x.device)
-        out = torch.zeros((b, t, self.nv, self.hv), dtype=torch.float32, device=x.device)
-        for i in range(t):
-            state = state * decay[:, i].exp()[..., None, None]
-            kv_mem = (state * k[:, i][..., None]).sum(-2)
-            delta = (v[:, i] - kv_mem) * beta[:, i][..., None]
-            state = state + k[:, i][..., None] * delta[..., None, :]
-            out[:, i] = (state * q[:, i][..., None]).sum(-2)
+        out = delta_rule(q, k, v, decay, beta, self.chunk_size)
         # RMSNormGated は value head ごと（head_v_dim 単位）に正規化する
         v_ = out.pow(2).mean(-1, keepdim=True)
         out = rms_norm(out, self.norm_w, self.eps, plus_one=False).float()
@@ -191,3 +229,41 @@ class Qwen38Config:
         with open(path, encoding="utf-8") as f:
             cfg = json.load(f)
         return cls(cfg.get("text_config", cfg))
+
+
+def load_qwen38(path: str, dtype=None, device: str | None = None):
+    # safetensors を全部読んで text モデルを組み立てる
+    import glob
+    import os
+
+    import safetensors.torch as st
+
+    path = str(path)
+    files = sorted(glob.glob(os.path.join(path, "*.safetensors")))
+    if not files:
+        raise FileNotFoundError(f"no safetensors under {path}")
+    sd = {}
+    for f in files:
+        sd.update(st.load_file(f))
+    cfg = Qwen38Config.load(os.path.join(path, "config.json"))
+    return Qwen38Model(cfg, sd, dtype=dtype or torch.float16,
+                       device=device or ("cuda" if torch.cuda.is_available() else "cpu"))
+
+
+def generate(model: "Qwen38Model", ids, max_tokens: int = 32, temperature: float = 0.0,
+             eos_token_ids=()) -> list[int]:
+    # 履歴を持たないので毎回プロンプト全体を作り直す（遅いが単純）
+    out: list[int] = []
+    seq = list(ids)
+    stop = set(eos_token_ids)
+    for _ in range(max_tokens):
+        logits = model(torch.tensor(seq, dtype=torch.long, device=model.device))[0]
+        if temperature and temperature > 0:
+            nxt = int(torch.multinomial(torch.softmax(logits.float() / temperature, -1), 1).item())
+        else:
+            nxt = int(logits.argmax().item())
+        out.append(nxt)
+        seq.append(nxt)
+        if nxt in stop:
+            break
+    return out

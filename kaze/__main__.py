@@ -5,6 +5,39 @@ import argparse
 import time
 
 
+def _maybe_qwen38(args) -> bool:
+    """Qwen3.8（Qwen3_5 text）なら専用の経路で生成して True を返す。"""
+    import json
+    import os
+
+    path = args.model
+    cfg_path = os.path.join(path, "config.json")
+    if not os.path.isfile(cfg_path):
+        return False
+    with open(cfg_path, encoding="utf-8") as f:
+        raw = json.load(f)
+    text_cfg = raw.get("text_config", raw)
+    if text_cfg.get("model_type") not in ("qwen3_5_text", "qwen3_5"):
+        return False
+
+    import time
+
+    from transformers import AutoTokenizer
+
+    from kaze.qwen38 import generate, load_qwen38
+
+    tok = AutoTokenizer.from_pretrained(path)
+    model = load_qwen38(path)
+    ids = tok(args.prompt).input_ids
+    t0 = time.perf_counter()
+    out = generate(model, ids, max_tokens=args.max_tokens, temperature=args.temperature,
+                   eos_token_ids=(tok.eos_token_id,) if tok.eos_token_id is not None else ())
+    dt = time.perf_counter() - t0
+    print(tok.decode(out, skip_special_tokens=True))
+    print(f"--- {len(out)} tokens in {dt:.2f}s ({len(out) / dt:.1f} tok/s)")
+    return True
+
+
 def main() -> None:
     ap = argparse.ArgumentParser("kaze")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -55,6 +88,8 @@ def main() -> None:
               use_cuda_graph=not args.no_cuda_graph, num_blocks=args.num_blocks,
               speculative=not args.no_spec, spec_k=args.spec_k)
 
+    if args.cmd == "generate" and _maybe_qwen38(args):
+        return
     if args.cmd == "generate":
         from kaze.sampler import SamplingParams
         p = SamplingParams(max_tokens=args.max_tokens, temperature=args.temperature)

@@ -30,6 +30,37 @@ BASE = {
 LAYER_TYPES = ["linear_attention", "full_attention", "linear_attention", "full_attention"]
 
 
+
+
+def check_load_and_generate() -> bool:
+    """safetensors に保存 → load_qwen38 → generate が通るか（CLI の経路）。"""
+    import json
+    import tempfile
+
+    import safetensors.torch as st
+    from transformers import AutoModelForCausalLM, Qwen3_5TextConfig
+
+    from kaze.qwen38 import generate, load_qwen38
+
+    raw = dict(BASE, layer_types=LAYER_TYPES, tie_word_embeddings=False)
+    torch.manual_seed(0)
+    ref = AutoModelForCausalLM.from_config(Qwen3_5TextConfig(**raw),
+                                          dtype=torch.float32).eval()
+    with tempfile.TemporaryDirectory() as d:
+        st.save_file({k: v.contiguous() for k, v in ref.state_dict().items()},
+                     os.path.join(d, "model.safetensors"))
+        with open(os.path.join(d, "config.json"), "w", encoding="utf-8") as f:
+            json.dump(dict(raw, model_type="qwen3_5_text"), f)
+        model = load_qwen38(d, dtype=torch.float32, device="cpu")
+    ids = [5, 12, 33]
+    want = ref(torch.tensor(ids)[None, :]).logits[0, -1]
+    got = model(torch.tensor(ids)).flatten()
+    cos = torch.nn.functional.cosine_similarity(want, got, dim=0).item()
+    out = generate(model, ids, max_tokens=4)
+    print("load_qwen38: cos %.6f  生成 %d トークン %s" % (cos, len(out), out[:4]))
+    return cos > 0.999 and len(out) == 4
+
+
 def main() -> int:
     try:
         from transformers import AutoModelForCausalLM, Qwen3_5TextConfig
@@ -55,7 +86,7 @@ def main() -> int:
     cos = torch.nn.functional.cosine_similarity(want, got, dim=0).item()
     diff = (want - got).abs().max().item()
     print("hybrid 4層（線形2 + full2）: cos %.6f  maxdiff %.6f" % (cos, diff))
-    ok = cos > 0.999
+    ok = cos > 0.999 and check_load_and_generate()
     print("ok" if ok else "FAIL")
     return 0 if ok else 1
 

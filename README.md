@@ -6,6 +6,9 @@ PyTorch はテンソル管理と重みの読み込みにだけ使い、計算は
 対象は Llama / Qwen2 / Qwen2.5 / Qwen3 / Mistral 系の dense decoder です（GQA、RoPE、RMSNorm、SwiGLU、
 qk-norm に対応しています）。重みは safetensors と旧形式の .bin の両方を読みます。
 
+Qwen3.8 系（full attention と線形注意が混ざる hybrid 構成）にも対応しています。ただしこちらは
+正しさを優先した実装で、量子化と KV キャッシュにはまだ載せていません。
+
 ## できること
 
 - weight-only 量子化（int8 / int4、group-wise）。量子化のための学習は不要です
