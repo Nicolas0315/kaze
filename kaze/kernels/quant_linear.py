@@ -262,6 +262,22 @@ W4A8_DECODE = False
 W8A8_SWIGLU_DECODE = False   # A/B knob: int8 dots for the decode gate_up
 
 
+def _cfg_override(n: int, k: int, kind: str):
+    """環境変数での一時上書き（掃引用）。KAZE_GEMV_CFG="wide=128,1,8,2;deep=64,8,4,3" """
+    import os
+
+    spec = os.environ.get("KAZE_GEMV_CFG")
+    if not spec:
+        return None
+    group = "wide" if n >= 8192 else ("deep" if k >= 4096 else "narrow")
+    for part in spec.split(";"):
+        if part.startswith(group + "="):
+            vals = [int(v) for v in part.split("=", 1)[1].split(",")]
+            if len(vals) == 4:
+                return tuple(vals)
+    return None
+
+
 def _cfg(n: int, k: int, kind: str) -> tuple[int, int, int, int]:
     """(block_n, split_k, num_warps, num_stages), tuned end-to-end on RTX 3070.
 
@@ -270,11 +286,17 @@ def _cfg(n: int, k: int, kind: str) -> tuple[int, int, int, int]:
     numbers were tuned before that and stay as measured, since split-K inside a
     captured decode step costs more than the bandwidth it buys there.
     """
+    override = _cfg_override(n, k, kind)
+    if override is not None:
+        return override
     if kind == "int4":
         if n >= 8192:
             # measured through the engine with interleaved A/B on 3B mixed
             # (block_n 64 -> 122.4 tok/s, 128 -> 133.9, 256 -> 102.1).  The wider
             # tile needs the longer K to pay off: at k=1536 (1.5B) it costs 8%.
+            # 7B (k=3584) measured end to end: 4 warps 64.0 tok/s, 8 warps 69.9.
+            if k >= 3072:
+                return (128, 1, 8, 2)
             return (128, 1, 4, 2) if k >= 2048 else (64, 1, 4, 2)
         if k >= 8192:
             return (64, 8, 4, 2)
