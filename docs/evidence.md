@@ -163,3 +163,30 @@ Qwen3.8 系（Qwen/Qwen3.8-27B とその派生）は、現状のままでは動�
 
 dense な自己回帰モデルであれば、量子化して VRAM に収まるサイズなら動きます（Qwen2.5 系、Qwen3 の
 0.6B などで確認済み）。
+
+## 8. Qwen3.8（Qwen3_5 text）への対応
+
+Qwen3.8 は full attention と gated delta net（線形注意）が交互に並ぶ hybrid 構成で、attention 側には
+出力ゲートと部分 RoPE が付きます。`kaze/qwen38.py` に実装し、同じ構成の小さな乱数モデルで
+transformers の参照実装と突き合わせています。
+
+| 構成 | cos | maxdiff |
+|---|---|---|
+| full attention のみ 4 層 | 1.000000 | 0.000000 |
+| hybrid 4 層（線形 2 + full 2） | 0.999997 | 0.000991 |
+
+実装で押さえた点:
+
+- 線形注意は q と k を head ごとに L2 正規化してから q を 1/sqrt(d) で割る（参照カーネルがそうしている）
+- attention の出力ゲートは config の output_gate_type に関わらず sigmoid
+- RMSNorm は重みを (1 + w) として掛ける（初期値がゼロなので、w をそのまま掛けると半分になる）
+- 線形注意の出力は value head ごとに gated RMSNorm（正規化してから silu(z) を掛ける）
+- RoPE は部分回転（partial_rotary_factor）で、テキストのみなら mrope は標準 RoPE と一致する
+
+**速度は未最適化です。** 線形注意をトークンごとの逐次ループで回しているため、実用速度には程遠く、
+27B を載せられる GPU でもこのままでは遅すぎます。chunked delta rule（64 トークン単位の行列演算）に
+書き換えるのが次の作業です。
+
+なお 27B は int4 でも約 13.5 GB 必要で、8 GB のカードには載りません（アーキテクチャ対応であって、
+この環境で動かせるという意味ではありません）。
+
