@@ -803,7 +803,10 @@ round 49 では +3.2% でしたが、あのときは KV が 8 ブロックしか
 | gcc | 16.2.1（-allow-unsupported-compiler で通る） |
 | 拡張のビルド・実行 | **成功**（誤差 2.4e-7） |
 
-最初の int4 GEMV は cos 0.75（不一致）・76 GB/s（Triton 版 328 GB/s）で負けました。
-ニブルの並びは 32bit ワードに 8 個（`NIBBLE_SHIFTS = (0,4,...,28)`）と確認しましたが、
-まだ一致していません。速度も、1 要素ずつ `__half2float` しているため出ていません。
+最初の int4 GEMV は、**数値は正しい**ことが分かりました。PyTorch で手展開した参照と比べて
+cos 1.000000、relerr 2.3e-4 です（Triton 版は relerr 3.4e-4）。round 81 で cos 0.75 と
+見えたのは計測スクリプト側の問題でした。
+
+残る課題は速度だけです（76 GB/s 対 Triton 328 GB/s）。1 要素ずつ `__half2float` している
+ため ALU 律速で、`half2` の FMA と dp4a 化、ベクトル読み幅の調整が要ります。
 カーネルは kaze/kernels/cuda_gemv.cu に実験として置いています（未接続）。
