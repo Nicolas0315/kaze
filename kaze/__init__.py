@@ -7,6 +7,11 @@ Design goals
   chunked prefill, CUDA-graph decode, OpenAI-compatible API.
 * Small enough to read: one Triton kernel per operation.
 """
+import os as _os
+
+# Triton 3.9 は既定で fp fusion を有効にするが、未設定だと毎回警告を出す。
+# 挙動は変えずに（有効のまま）静かにする。
+_os.environ.setdefault("TRITON_DEFAULT_FP_FUSION", "1")
 
 from kaze.config import ModelConfig
 
