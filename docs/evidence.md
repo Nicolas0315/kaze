@@ -418,3 +418,23 @@ top-level は `lm_head.weight` / `model.embed_tokens.weight` / `model.norm.weigh
 
 これで、A100 で読み込むときに `KeyError` で落ちる可能性は潰せています。
 残る失敗要因はメモリだけです（int4 で約 15GB）。
+
+### Qwen3.8-27B の実測（A100 40GB・Colab CLI）
+
+Colab の A100-SXM4-40GB で、実際の Qwen3.8-27B を int4 で読み込んで測りました。
+
+| 項目 | 実測 |
+|---|---|
+| 重みのダウンロード（55GB） | 169 秒 |
+| 読み込み（量子化込み・851 テンソル） | 162 秒 |
+| GPU 使用量（int4） | **15.81 GB** |
+| 素の経路（1 演算ずつ） | 16 トークン / 14.4 秒 = **1.1 tok/s** |
+| **CUDA Graph** | 64 トークン / 3.05 秒 = **21.0 tok/s** |
+
+グラフ化で **19 倍**。生成された文章も日本語として自然でした（深海調査船の説明）。
+
+注意点として、Colab には `flash-linear-attention` が入っていないため、prefill は
+参照実装（PyTorch）にフォールバックします。`pip install flash-linear-attention` で
+prefill はさらに速くなります。
+
+視覚側のテンソル 348 個は読み飛ばし、テキスト側 851 個だけを読み込んでいます。
