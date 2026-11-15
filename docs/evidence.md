@@ -513,3 +513,25 @@ llama.cpp は 82.2 tok/s なので約 328 GB/s を使っており、差は 72 GB
 この落とし穴を踏まえた測定スクリプトを `bench/compare_ttft.py` に置きました。
 デコード速度の比較（`bench/compare_llamacpp.py`）は、生成長 16 と 128 の差分で
 プロンプト処理を差し引く方式なので、この問題の影響を受けません。
+
+### 現状の総まとめ（round 21・verify.py 全緑）
+
+`python3 bench/verify.py` の結果です（GPU を使っている他プロセス 4 個の状態）。
+
+```
+tests            17/17 passed
+stress           12/12 trials clean
+smoke            all ok
+qwen3.8 Graph    先頭トークン一致 True
+qwen3.8 (Qwen3_5) ok
+llm (Python API) 5/5 passed
+server (HTTP)    all ok
+0.5B  decode 635.6 tok/s  prefill 39,947 tok/s
+1.5B  decode 273.6 tok/s  prefill 14,182 tok/s
+3B    decode 167.2 tok/s  prefill  7,600 tok/s
+drafter code/jsonl/long/story  1513 / 1337 / 933 / 496
+all ok
+```
+
+7B の wide GEMV は split_k 2 / 4 を試しても 69.9 tok/s のままでした。
+タイル設定とマスク除去で動かせる範囲は完全に尽きており、次はカーネル本体の書き直しです。
