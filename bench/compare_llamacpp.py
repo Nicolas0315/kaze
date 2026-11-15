@@ -33,14 +33,23 @@ def bench_kaze(model_name: str = "Qwen2.5-3B-Instruct", kind: str = "int4") -> d
     llm = LLM(os.path.join(MODELS, model_name), kind=kind, lm_head_kind=kind,
               speculative=False)
     prompt = prompt_text(PROMPT_TOKENS)
-    llm.generate(prompt, max_tokens=8, temperature=0.0)          # 暖機
+    llm.generate(prompt, max_tokens=8, temperature=0.0)      # 暖機
     torch.cuda.synchronize()
-    t0 = time.perf_counter()
-    out = llm.generate(prompt, max_tokens=GEN_TOKENS, temperature=0.0)
-    torch.cuda.synchronize()
-    dt = time.perf_counter() - t0
-    return {"engine": "kaze", "decode_tok_s": len(out.tokens) / dt,
-            "bytes_per_token_gb": None}
+    # llama.cpp 側と条件を揃えるため、プロンプト評価の分を差し引く
+    times = {}
+    for n in (16, GEN_TOKENS):
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        llm.generate(prompt, max_tokens=n, temperature=0.0)
+        torch.cuda.synchronize()
+        times[n] = time.perf_counter() - t0
+    decode = (GEN_TOKENS - 16) / max(times[GEN_TOKENS] - times[16], 1e-9)
+    del llm
+    import gc
+
+    gc.collect()
+    torch.cuda.empty_cache()
+    return {"engine": "kaze", "decode_tok_s": decode}
 
 
 def bench_llamacpp() -> dict:
@@ -67,8 +76,18 @@ def bench_llamacpp() -> dict:
     return {"engine": "llama.cpp", "decode_tok_s": decode}
 
 
-if __name__ == "__main__":
+def main() -> None:
+    # 引数で GGUF と Kaze のモデルを差し替えられる（サイズごとに A/B する）
+    global GGUF
+    if len(sys.argv) > 2:
+        GGUF = sys.argv[1]
+        model = sys.argv[2]
+    else:
+        model = "Qwen2.5-3B-Instruct"
     # 8GB のカードでは 2 つ同時に載らないので、先に llama.cpp を測って解放する
-    rows = [bench_llamacpp(), bench_kaze()]
-    for row in rows:
+    for row in (bench_llamacpp(), bench_kaze(model)):
         print(json.dumps(row, ensure_ascii=False))
+
+
+if __name__ == "__main__":
+    main()
