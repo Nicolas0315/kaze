@@ -8,7 +8,8 @@ qk-norm に対応しています）。重みは safetensors と旧形式の .bin
 
 Qwen3.8 系（full attention と線形注意が混ざる hybrid 構成）にも対応しています。重みは int8/int4 に
 量子化でき、KV キャッシュと再帰状態キャッシュも持っています。decode は CUDA Graph に固められるので
-（`--graph`）、1 演算ずつ投げる場合の 5.7 倍で進みます（詳しくは docs/evidence.md）。
+（`--graph`）、1 演算ずつ投げる場合の 4〜5 倍で進みます。27B を A100 40GB で測ると int4（15.8GB）で
+20.6〜21.0 tok/s、素の経路（1.1 tok/s）の約 19 倍です（詳しくは docs/evidence.md）。
 
 ## できること
 
@@ -18,6 +19,8 @@ Qwen3.8 系（full attention と線形注意が混ざる hybrid 構成）にも�
 - プレフィックス共有。同じシステムプロンプトを使う複数リクエストで KV を共有します
 - 投機的デコード。プロンプト内の繰り返しと、生成済みの記録からの外挿で候補を作り、まとめて検証します
 - OpenAI 互換の HTTP サーバを備えています（chat / completions / SSE ストリーミング）
+- hybrid 注意（線形注意 + full attention）のモデルにも対応しています。CUDA Graph と量子化は
+  そちらでも使えます（`kaze serve --model <Qwen3.8> --graph`）
 
 ## 速度
 
