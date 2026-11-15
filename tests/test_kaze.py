@@ -401,6 +401,28 @@ def test_moe_weight_bytes() -> None:
 
 
 
+@check("tile-major (int4 の並べ替え)")
+def _() -> None:
+    """tile-major の複製を作っても gemv_swiglu の出力が変わらないこと。"""
+    import torch
+
+    from kaze.kernels import quant_linear as K
+    from kaze.quant import QuantLinear
+
+    torch.manual_seed(7)
+    n, k = 4096, 1024
+    w = (torch.randn(n, k, device="cuda") * 0.02).half()
+    x = (torch.randn(16, k, device="cuda") * 0.5).half()
+    lin = QuantLinear.from_float(w, None, kind="int4", group=128)
+    base = K.gemv_swiglu(x, lin, 16, n // 2).clone()
+    lin.make_tile_major_copy()
+    tm = K.gemv_swiglu(x, lin, 16, n // 2)
+    cos = torch.nn.functional.cosine_similarity(
+        base.float().flatten(), tm.float().flatten(), 0).item()
+    assert cos > 0.999, f"tile-major の出力が一致しません (cos={cos:.6f})"
+
+
+
 if __name__ == "__main__":
     sys.exit(main())
 
