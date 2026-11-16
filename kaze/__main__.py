@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
 import time
 
 
@@ -12,6 +13,9 @@ def main() -> None:
 
     def common(p):
         p.add_argument("--model", required=True)
+        # a .gguf file carries weights only, so the tokenizer has to come from elsewhere
+        p.add_argument("--tokenizer", default=None,
+                       help="tokenizer directory (needed when --model is a .gguf file)")
         p.add_argument("--kind", default="int8", choices=["int4", "int8", "fp16"])
         # 128 matches LLM's default and is 13% faster for int4; pass --group 64 for a
         # ~19% KL improvement at that speed cost
@@ -31,6 +35,10 @@ def main() -> None:
         p.add_argument("--max-batch", type=int, default=64)
         p.add_argument("--max-batched-tokens", type=int, default=2048)
         p.add_argument("--no-cuda-graph", action="store_true")
+        # Force the vendor policy (graphs/float8), not the PyTorch device: this is how the
+        # ROCm path runs on a CUDA box, and how an operator pins the known-good policy.
+        p.add_argument("--backend", default=None, choices=["cuda", "rocm", "cpu"],
+                       help="force the backend policy (same as KAZE_BACKEND=...)")
         p.add_argument("--no-spec", action="store_true")
         # keep this in step with LLM(spec_k=...): the CLI default used to be 8 while the
         # library default was 16, so `kaze serve` silently ran the narrow draft.  Measured
@@ -75,14 +83,28 @@ def main() -> None:
             ap.error(f"--{name.replace('_', '-')} must be positive")
     if args.group % 8:
         ap.error("--group must be a multiple of 8")
+    if args.backend:
+        # backend.py reads this at Engine construction, so set it before the model loads
+        os.environ["KAZE_BACKEND"] = args.backend
+    from kaze.backend import describe
     from kaze.llm import LLM
 
     llm = LLM(args.model, kind=args.kind, group=args.group, lm_head_kind=args.lm_head_kind,
+              tokenizer_path=args.tokenizer,
                cache_dtype=args.cache_dtype,
               max_batch=args.max_batch, max_batched_tokens=args.max_batched_tokens,
               use_cuda_graph=not args.no_cuda_graph, num_blocks=args.num_blocks,
               speculative=not args.no_spec, spec_k=args.spec_k,
               start_loop=args.cmd != "bench")
+
+    # one startup line: which backend policy was chosen and what it actually enabled.
+    # getattr keeps embedders and the audit fakes (engine without a backend) working.
+    engine = getattr(llm, "engine", None)
+    backend = getattr(engine, "backend", None)
+    if backend is not None:
+        print(f"kaze: {describe(backend)} "
+              f"cuda_graph={'on' if getattr(engine, 'use_cuda_graph', False) else 'off'} "
+              f"cache_dtype={getattr(engine, 'cache_dtype', 'n/a')}", flush=True)
 
     try:
         if args.cmd == "generate":

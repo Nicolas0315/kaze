@@ -10,6 +10,7 @@ import torch
 from safetensors import safe_open
 
 from kaze.config import ModelConfig
+from kaze.gguf import GGUFWeights, resolve_gguf
 from kaze.model import KazeModel, LayerWeights
 from kaze.quant import QuantLinear, concat_rows
 
@@ -131,23 +132,61 @@ def _q(t: torch.Tensor, bias: torch.Tensor | None, kind: str, group: int, device
                                   kind=kind, group=group)
 
 
-def load_model(path: str, kind: str = "int8", group: int = 128, device: str = "cuda",
-               dtype: torch.dtype = torch.float16, lm_head_kind: str | None = None,
-               verbose: bool = True) -> KazeModel:
-    # Only these quantisation group widths are verified on the GPU paths.  group 32 hits an
-    # illegal memory access in the int4 decode matvec (measured 2026-11-16), and anything
-    # outside {64, 128} would at best be untested: fail loudly instead of risking a
-    # corrupted CUDA context or silently wrong output.  64 is the quality option: KL
-    # 0.0126 -> 0.0064 on 0.5B for -3% decode (bench/kl_multi.py, docs/evidence.md).
+# Only these quantisation group widths are verified on the GPU paths.  group 32 hits an
+# illegal memory access in the int4 decode matvec (measured 2026-11-16), and anything
+# outside {64, 128} would at best be untested: fail loudly instead of risking a
+# corrupted CUDA context or silently wrong output.  64 is the quality option: KL
+# 0.0126 -> 0.0064 on 0.5B for -3% decode (bench/kl_multi.py, docs/evidence.md).
+def _check_group(kind: str, group: int, device: str) -> None:
     if kind in ("int4", "int8") and group not in (64, 128) and device != "cpu":
         raise ValueError(
             f"group {group} is not supported for {kind} weights on the GPU: use 64 or 128 "
             "(128 = fastest, 64 = half the KL for -3% decode). Other widths are untested "
             "and group 32 crashes the int4 decode kernel with an illegal memory access.")
+
+
+def _hf_dir_for(path: str, weights_file: str) -> str | None:
+    """Directory holding config.json for a GGUF file, when there is one."""
+    if os.path.isdir(path) and os.path.exists(os.path.join(path, "config.json")):
+        return path
+    directory = os.path.dirname(os.path.abspath(weights_file))
+    if os.path.exists(os.path.join(directory, "config.json")):
+        return directory
+    return None
+
+
+def load_model(path: str, kind: str = "int8", group: int = 128, device: str = "cuda",
+               dtype: torch.dtype = torch.float16, lm_head_kind: str | None = None,
+               verbose: bool = True, tokenizer_dir: str | None = None) -> KazeModel:
+    """Build a KazeModel from safetensors/.bin weights, or from a single GGUF file.
+
+    A path ending in .gguf - or a directory holding exactly one .gguf - is read
+    through kaze.gguf: ggml blocks are dequantised to fp16 and then requantised
+    into kaze's flat int4/int8 layout.  config.json and the tokenizer still come
+    from the HuggingFace directory (tokenizer_dir), because GGUF does not carry
+    everything kaze needs to describe the model (llama3-style rope scaling, for
+    one); without it the config is derived from the GGUF metadata itself.
+    """
+    _check_group(kind, group, device)
+    weights_file = resolve_gguf(path)
+    if weights_file is not None:
+        weights = GGUFWeights(weights_file,
+                              tokenizer_dir=tokenizer_dir or _hf_dir_for(path, weights_file),
+                              verbose=verbose)
+        try:
+            return _build_model(weights.cfg, weights, weights.keys(), kind, group,
+                                torch.device(device), dtype, lm_head_kind, verbose)
+        finally:
+            weights.close()
     cfg = ModelConfig.from_pretrained(path)
-    dev = torch.device(device)
     reader = _Reader(path)
-    keys = reader.keys()
+    return _build_model(cfg, reader, reader.keys(), kind, group, torch.device(device),
+                        dtype, lm_head_kind, verbose)
+
+
+def _build_model(cfg: ModelConfig, reader, keys: list[str], kind: str, group: int,
+                 dev: torch.device, dtype: torch.dtype,
+                 lm_head_kind: str | None, verbose: bool) -> KazeModel:
     prefix = "model." if any(k.startswith("model.embed_tokens") for k in keys) else ""
     def checked(name: str, shape: tuple[int, ...]) -> torch.Tensor:
         tensor = reader.get(name)

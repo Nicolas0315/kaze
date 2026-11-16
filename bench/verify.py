@@ -18,7 +18,7 @@ REGRESSIONS = ("test_regressions.py", "test_engine_regressions.py",
                "test_kernel_regressions.py", "test_loader_cli_regressions.py",
                "test_worker_failure.py", "test_entry_audit.py", "test_api_audit.py",
                "test_sampler_audit.py", "test_scheduler_audit.py", "test_weights_audit.py",
-               "test_model_audit.py")
+               "test_model_audit.py", "test_backend.py", "test_gguf.py")
 
 # (label, model, threshold decode, threshold prefill)
 DECODE = [

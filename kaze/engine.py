@@ -25,6 +25,7 @@ from typing import Callable, Iterable
 
 import torch
 
+from kaze.backend import Backend, cache_dtype_policy, detect_device
 from kaze.cache import KVCache, blocks_for
 from kaze.config import ModelConfig
 from kaze.model import KazeModel
@@ -280,7 +281,8 @@ class Engine:
                  speculative: bool = False, spec_k: int = 5, verbose: bool = True,
                  use_draft_model: bool = False,
                  spec_accept_ema: float = 1.0, cache_dtype: str = "fp16",
-                 draft_model: "KazeModel | None" = None):
+                 draft_model: "KazeModel | None" = None,
+                 backend: Backend | None = None):
         for name, value in (("block_size", block_size), ("max_batch", max_batch),
                             ("max_batched_tokens", max_batched_tokens), ("spec_k", spec_k),
                             ("num_blocks", num_blocks), ("max_model_len", max_model_len)):
@@ -290,6 +292,9 @@ class Engine:
                 raise ValueError(f"{name} must be a positive integer")
         self.model = model
         self.cfg: ModelConfig = model.cfg
+        # the vendor policy (graphs, float8) lives in kaze/backend.py; detect it once here
+        # so every later `self.use_cuda_graph` check follows the same decision
+        self.backend = backend if backend is not None else detect_device(model.device)
         self.tokenizer = tokenizer
         self.block_size = block_size
         self.max_batch = max_batch
@@ -309,7 +314,13 @@ class Engine:
                     "if long-range recall matters", stacklevel=2)
         self.max_model_len = min(max_model_len or cap, cap)
         self.max_batched_tokens = max_batched_tokens
-        self.use_cuda_graph = use_cuda_graph
+        # A backend that does not trust capture (ROCm, CPU reference) runs eager: a
+        # hipGraph replay can fault or reuse a stale allocator pool depending on the ROCm
+        # version, so the decision is made here instead of at each capture site.
+        self.use_cuda_graph = use_cuda_graph and self.backend.graphs_ok
+        if use_cuda_graph and not self.use_cuda_graph:
+            print(f"  cuda graph: disabled by backend policy ({self.backend.vendor}); "
+                  f"running the eager path", flush=True)
         self.enable_prefix_cache = enable_prefix_cache
         self.speculative = speculative
         self.spec_k = spec_k
@@ -342,8 +353,17 @@ class Engine:
             # V goes to fp8: 25% less KV memory for long contexts
             "fp8v": (_f16, torch.float8_e5m2),
         }
-        _kd, _vd = _kinds.get(cache_dtype, (_f16, _f16))
-        if cache_dtype == "fp8":
+        # float8 KV needs a backend that actually stores/loads float8 (sm_90+, gfx94x).
+        # Downgrade once here with a warning instead of faulting on the first cache write.
+        self.cache_dtype = cache_dtype_policy(cache_dtype, self.backend)
+        if self.cache_dtype != cache_dtype:
+            import warnings
+            warnings.warn(
+                f"cache_dtype {cache_dtype!r} needs float8 KV, which this backend "
+                f"({self.backend.vendor}) does not support; falling back to fp16",
+                stacklevel=2)
+        _kd, _vd = _kinds.get(self.cache_dtype, (_f16, _f16))
+        if self.cache_dtype == "fp8":
             # quantising the keys costs long-range recall: measured 2026-11-16 on 0.5B int4,
             # needle-in-a-haystack MISSes at both 4K and 16K ("The passkey is 739" instead of
             # 7391) while fp8v (K fp16, V fp8) hits at both.  Say so instead of letting it
@@ -647,7 +667,7 @@ class Engine:
 
     def capture_spec_graph(self) -> None:
         """Capture the verification pass (fixed K tokens) for each bucket."""
-        if not self.speculative:
+        if not self.speculative or not self.use_cuda_graph:
             return
         for k, tdim in self.spec_plan:
             st = self._spec_static(tdim, k)

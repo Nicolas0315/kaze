@@ -48,7 +48,8 @@ class LLM:
         self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_path or model_path)
         t0 = time.time()
         self.model = load_model(model_path, kind=kind, group=group, lm_head_kind=lm_head_kind,
-                                device=device, verbose=verbose)
+                                device=device, verbose=verbose,
+                                tokenizer_dir=tokenizer_path)
         if verbose:
             print(f"  loaded in {time.time() - t0:.1f}s", flush=True)
         self.engine = Engine(self.model, tokenizer=self.tokenizer, block_size=block_size,

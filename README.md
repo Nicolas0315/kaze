@@ -8,6 +8,8 @@
 - 量子化: int4 / int8 / fp16（group 64 と 128）
 - KV キャッシュ dtype: fp16 既定、fp8v で 25% 削減
 - 対応モデルと形式: Llama / Qwen2 / Qwen2.5 / Qwen3 / Mistral 系 dense decoder（GQA, RoPE, RMSNorm, SwiGLU, qk-norm）、safetensors と旧 .bin の両方を読む
+- **GGUF も読める**（Q4_K / Q5_K / Q6_K / Q8_0 / Q4_0 / Q5_0 / Q8_K、F16 / F32）。読み込み時に kaze の int4 / int8 へ再量子化する
+- **AMD（ROCm）でも動く**。バックエンドを検出してグラフ取得や fp8 KV を自動で切り替える
 
 ## 速度
 
@@ -78,6 +80,35 @@ NVIDIA GPU（CUDA）専用。CPU だけで推論する経路は持たない。
 カーネルは起動時にその GPU 向けにコンパイルされるので、Ampere 以降の別のカードでも動く。ただしタイルとパラメータは 8GB / 448 GB/s 級（RTX 3070）で調整しており、帯域や SM 数が違うカードでは再調整の余地がある。
 
 KV キャッシュの fp8v（V のみ fp8）は sm_86 でも動作を確認済み。fp8 ネイティブ命令の有無で速度は変わる。
+
+## GGUF
+
+量子化済みの単一ファイル（GGUF）をそのまま読める。読み込み時に ggml ブロックを fp16 に戻し、kaze の int4 group128 / int8 に詰め直す。
+
+```bash
+python -m kaze generate --model model-Q4_K_M.gguf --tokenizer <hf_dir> --kind int8 "..."
+```
+
+- 対応ブロック: Q4_0 / Q4_1 / Q5_0 / Q5_1 / Q8_0 / Q4_K / Q5_K / Q6_K / Q8_K / F16 / F32 / BF16
+- 逆量子化は llama.cpp の実装とビット一致（実ファイルのブロックで max abs diff 0.000e+00）
+- GGUF は重みだけなので、**トークナイザは HF ディレクトリから取る**（`--tokenizer`）
+- 未対応: IQ* / TQ* / MXFP4 系、分割 GGUF、GGUF 内蔵の語彙
+
+詳細と名前対応表は [docs/gguf.md](docs/gguf.md)。
+
+## AMD（ROCm）
+
+バックエンドは起動時に判定する。ROCm では hipGraph の capture が不安定なので**グラフは既定オフ**、fp8 KV は非対応なら fp16 に落とす。
+
+```bash
+python -m kaze serve --model <hf_dir> --kind int4 --backend rocm --port 8000
+# kaze: backend=rocm device=... graphs=off fp8=unsupported cuda_graph=off cache_dtype=fp16
+```
+
+- カーネルは Triton なので ROCm でもコンパイルできるが、**タイルは sm_86 で調整した値**であり、AMD での速度は未測定
+- グラフ無効の影響は CUDA 上で実測済み（tpot 1.16 ms → 5.23 ms、約 4.5 倍）
+
+導入手順と注意は [docs/amd.md](docs/amd.md)。
 
 ## 使い方
 
