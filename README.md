@@ -110,9 +110,31 @@ Python API は `kaze.LLM`。
 - MLA / Gemma3 / Phi3 は未対応
 - 14B 以上は 8GB に載らない
 
-## 実装の補足
+## 実装
 
-カーネル実装には Triton を使用する。実行には CUDA Graph を併用する。
+推論の経路は自前で書いている。PyTorch はモデルを呼ぶためではなく、テンソル確保と一部の要素演算にだけ使う。
+
+自前（Python 6,601 行、うち Triton カーネル 35 本）:
+
+- int4 / int8 の GEMV・GEMM、融合 SwiGLU、paged attention（prefill / decode）、split-K、RoPE 融合、RMSNorm と活性量子化の融合、epilogue の畳み込み
+- 継続バッチング、KV ブロック割当、プレフィックス共有
+- ページド KV キャッシュ（16 トークン / ブロック、fp16 / fp8v / fp8）
+- group-wise 量子化（int4 / int8 / 層ごとの mixed）
+- 投機的デコード（prompt-lookup のドラフト、受理判定、受理率 EMA による自動フォールバック）
+- OpenAI 互換サーバ、ワーカースレッド、`/metrics`
+- 重み読み込み（safetensors と旧 .bin）
+
+ライブラリ:
+
+| 依存 | 用途 |
+|---|---|
+| PyTorch | テンソル確保、fp16 重みの `F.linear`、MoE の softmax / topk、サンプラの topk / multinomial、CPU 参照実装 |
+| Triton | カーネルのコンパイラ（カーネル本体は自作） |
+| transformers | トークナイザと config の読み取り |
+| fastapi / uvicorn | HTTP 層 |
+| safetensors | 重みファイルの読み取り |
+
+CUDA Graph は decode の起動オーバーヘッドを消すために使う。
 
 decode は重みの読み出し帯域で決まる。実効値は 0.5B で 223 GB/s（ピークの 50%）、7B で 320 GB/s（ピークの 71%）。
 
