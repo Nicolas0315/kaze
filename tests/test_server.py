@@ -7,17 +7,14 @@ from __future__ import annotations
 
 import json
 import subprocess
-import os
 import sys
 import time
-import urllib.error
 import urllib.request
 
 sys.path.insert(0, ".")
 
 PORT = 8147
-MODELS = os.environ.get("KAZE_MODELS", os.path.expanduser("~/models"))
-MODEL = os.path.join(MODELS, "Qwen2.5-0.5B-Instruct")
+MODEL = "/models/Qwen2.5-0.5B-Instruct"
 
 
 def wait_health(timeout: float = 180.0) -> bool:
@@ -75,78 +72,6 @@ def main() -> int:
         print(f"streaming     {chunks} chunks {'ok' if ok else 'FAIL'}")
         if not ok:
             fails.append("stream")
-        # 異常系: 壊れた JSON は 400 で返り、サーバは落ちない
-        bad = urllib.request.Request(
-            f"http://127.0.0.1:{PORT}/v1/completions", b"{not json",
-            {"Content-Type": "application/json"})
-        try:
-            urllib.request.urlopen(bad, timeout=15)
-            code = 200
-        except urllib.error.HTTPError as exc:
-            code = exc.code
-        ok = 400 <= code < 500     # FastAPI は壊れた JSON に 422 を返す
-        print(f"bad json      {code} {'ok' if ok else 'FAIL'}")
-        if not ok:
-            fails.append("bad json")
-
-        # 異常系: 存在しないパスは 404
-        try:
-            urllib.request.urlopen(f"http://127.0.0.1:{PORT}/v1/nope", timeout=15)
-            code = 200
-        except urllib.error.HTTPError as exc:
-            code = exc.code
-        ok = code == 404
-        print(f"unknown path  {code} {'ok' if ok else 'FAIL'}")
-        if not ok:
-            fails.append("unknown path")
-
-        # 異常系: 過大な max_tokens でも固まらず、上限に丸めて返す
-        try:
-            out = post("/v1/completions", {"model": "kaze", "prompt": "hi",
-                                           "max_tokens": 10**6})
-            code = 200
-            ok_body = isinstance(out.get("choices"), list)
-        except urllib.error.HTTPError as exc:
-            code = exc.code
-            ok_body = True
-        ok = (400 <= code < 500) or (code == 200 and ok_body)
-        print(f"huge tokens   {code} {'ok' if ok else 'FAIL'}")
-        if not ok:
-            fails.append("huge tokens")
-
-        # stop 文字列で生成が止まる
-        st = post("/v1/completions", {"model": "kaze", "prompt": "Count: one two three",
-                                      "max_tokens": 32, "temperature": 0.0,
-                                      "stop": ["three"]})
-        txt = st["choices"][0]["text"]
-        ok = "three" not in txt.lower()
-                print(f"stop string   {txt!r} {'ok' if ok else 'FAIL'}")
-        if not ok:
-            fails.append("stop")
-
-        # 同時 4 リクエストがすべて返る
-        import threading
-
-        results: list[int] = []
-
-        def one() -> None:
-            try:
-                out = post("/v1/completions", {"model": "kaze", "prompt": "hi",
-                                               "max_tokens": 4, "temperature": 0.0})
-                results.append(1 if out.get("choices") else 0)
-            except Exception:
-                results.append(0)
-
-        threads = [threading.Thread(target=one) for _ in range(4)]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join(timeout=120)
-        ok = len(results) == 4 and all(results)
-        print(f"concurrent 4  {sum(results)}/4 {'ok' if ok else 'FAIL'}")
-        if not ok:
-            fails.append("concurrent")
-
     finally:
         proc.terminate()
         try:

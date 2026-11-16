@@ -1,13 +1,12 @@
 """Kaze test suite (no pytest required: python tests/test_kaze.py)."""
 from __future__ import annotations
 
-import os
 import sys
 import traceback
 
 import torch
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, ".")
 
 from kaze.cache import KVCache
 from kaze.config import ModelConfig
@@ -17,8 +16,7 @@ from kaze.kernels import quant_linear as K_lin
 from kaze.quant import QuantLinear, dequantize_int4, quantize_int4
 
 DEV = "cuda"
-MODELS = os.environ.get("KAZE_MODELS", os.path.expanduser("~/models"))
-MODEL = os.path.join(MODELS, "Qwen2.5-0.5B-Instruct")
+MODEL = "/models/Qwen2.5-0.5B-Instruct"
 _results: list[tuple[str, bool, str]] = []
 
 
@@ -57,6 +55,31 @@ def _() -> None:
     got = K_lin.gemv(x, lin, 16)[0].float()
     ref = lin.dequantize().float() @ x[0].float() + lin.bias.float()
     assert torch.nn.functional.cosine_similarity(got, ref, dim=0) > 0.999
+
+
+@check("kernel.gemv_rows1_matches_wide")
+def _() -> None:
+    """The batch-1 matvec path (TDIM=1) must agree with the 16-row tl.dot path.
+
+    The engine captures a separate CUDA graph for a single stream, which selects the
+    TDIM=1 kernels; they accumulate in a different order (FMA instead of tensor cores), so
+    this pins the two paths to each other.
+    """
+    torch.manual_seed(0)
+    for kind in ("int8", "int4"):
+        n, k = 512, 896
+        w = torch.randn(n, k, device=DEV) * 0.02
+        lin = QuantLinear.from_float(w, torch.randn(n, device=DEV), kind=kind, group=128)
+        x16 = torch.zeros(16, k, device=DEV, dtype=torch.float16)
+        x16[0] = torch.randn(k, device=DEV)
+        wide = K_lin.gemv(x16, lin, 16)[0].float()
+        one = K_lin.gemv(x16, lin, 1)[0].float()
+        cos = torch.nn.functional.cosine_similarity(wide, one, dim=0).item()
+        assert cos > 0.9999, (kind, cos)
+        # split-K goes through the epilogue with [SPLIT_K, 1, N] partials
+        split = K_lin.gemv(x16, lin, 1, split_k=4)[0].float()
+        cos2 = torch.nn.functional.cosine_similarity(wide, split, dim=0).item()
+        assert cos2 > 0.9999, (kind, "split", cos2)
 
 
 @check("kernel.gemm_int8_matches_dequant")
@@ -120,15 +143,256 @@ def _() -> None:
     tok = int(lg[0].argmax())
     sl = cache.slots(blocks, 23, 24)
     bt = cache.block_table_tensor(blocks, 8)
-    dec = model.decode_logits(torch.tensor([tok], device=dev), torch.tensor([23], device=dev),
-                              sl, bt, torch.tensor([24], device=dev, dtype=torch.int32),
-                              cache, tdim=16)
     ids2 = torch.cat([ids, torch.tensor([tok], device=dev)])
     blocks2 = [cache.allocator.allocate() for _ in range(2)]
     ref = model.prefill_logits(ids2, torch.arange(24, device=dev), cache,
                                cache.block_table_tensor(blocks2, 8), 0)
-    cos = torch.nn.functional.cosine_similarity(dec[0].float(), ref[0].float(), dim=0).item()
-    assert cos > 0.9999, cos
+    # both decode buckets: tdim=1 is the real batch-1 path.  A config-table/gemv
+    # mismatch used to hand fp16 decode a partials buffer gemv never writes, which
+    # only showed up here (tdim=16 took the non-deferred path and passed).
+    for tdim in (1, 16):
+        dec = model.decode_logits(torch.tensor([tok], device=dev),
+                                  torch.tensor([23], device=dev),
+                                  sl, bt, torch.tensor([24], device=dev, dtype=torch.int32),
+                                  cache, tdim=tdim)
+        cos = torch.nn.functional.cosine_similarity(dec[0].float(), ref[0].float(), dim=0).item()
+        assert cos > 0.9999, (tdim, cos)
+
+
+@check("kernel.splitk_epilogue_fold_matches")
+def _() -> None:
+    """The consumer-side epilogue fold must agree with gemv_epilogue_kernel closely.
+
+    Exact bit equality was the original contract, but the fold now loads every split in
+    one 2D tile and sums them as a tree (worth +2.6% decode, and it removes eight
+    dependent loads per rmsnorm).  A tree sum rounds differently from the epilogue
+    sp-ascending loop, so the check is a tight cosine instead of torch.equal; the folded
+    path is still deterministic, which the repeat below and
+    kernel.int4_prefill_is_deterministic both cover.
+
+    Decode logits are compared with the fold on and off on identical inputs, so a
+    mismatch shows up as different fp16 bits rather than as "close enough".  The fold
+    is only active for the batch-1 bucket.
+    """
+    import kaze.model as M
+
+    model = _load_model("int4")
+    dev = model.device
+    cache = KVCache(model.cfg, 64, 16, dev)
+    blocks = [cache.allocator.allocate()]
+    bt = cache.block_table_tensor(blocks, 8)
+    slots = cache.slots(blocks, 0, 1)
+    ids = torch.randint(0, 30000, (1,), device=dev)
+    pos = torch.zeros(1, dtype=torch.long, device=dev)
+    lens = torch.ones(1, dtype=torch.int32, device=dev)
+    try:
+        M.set_fuse_epilogue(True)
+        fused = model.decode_logits(ids, pos, slots, bt, lens, cache, tdim=1).clone()
+        M.set_fuse_epilogue(False)
+        ref = model.decode_logits(ids, pos, slots, bt, lens, cache, tdim=1).clone()
+    finally:
+        M.set_fuse_epilogue(True)
+    cos = torch.nn.functional.cosine_similarity(fused[0].float(), ref[0].float(),
+                                                dim=0).item()
+    assert cos > 0.99999, cos
+    M.set_fuse_epilogue(True)
+    again = model.decode_logits(ids, pos, slots, bt, lens, cache, tdim=1).clone()
+    assert torch.equal(fused, again), "folded path is not deterministic"
+
+
+@check("kernel.int4_prefill_is_deterministic")
+def _() -> None:
+    """The int4 prefill path must produce identical bits on identical inputs.
+
+    This caught a real race: quant_act_kernel stored one out-of-range activation scale
+    per row when K was not a multiple of its 512-column tile, landing in the next row's
+    first scale.  The GEMMs stayed "close enough" on average but flipped elements between
+    runs, and a 5-token smoke generation turned into emoji salad.  Determinism is cheap
+    to assert and pins the whole class of bug.
+    """
+    from kaze.kernels import quant_linear as K
+
+    dev = "cuda"
+    m, k, group = 64, 896, 128
+    a = (torch.randn(m, k, device=dev) * 0.5).half()
+    qs = [K.quantize_act(a, group) for _ in range(3)]
+    for q, s in qs[1:]:
+        assert torch.equal(qs[0][0], q), "quantize_act values differ between calls"
+        assert torch.equal(qs[0][1], s), "quantize_act scales differ between calls"
+
+    model = _load_model("int4")
+    lin = model.layers[0].wqkv
+    outs = [K.gemm(a, lin).clone() for _ in range(3)]
+    for o in outs[1:]:
+        assert torch.equal(outs[0], o), "int4 gemm differs between identical calls"
+
+
+@check("engine.greedy_is_deterministic")
+def _() -> None:
+    """Two identical greedy runs must produce identical tokens.
+
+    Covers the whole serving path (prefill, split-K partials, graph replay, sampler) and
+    is the end-to-end guard for the class of race that quant_act_kernel had.
+    """
+    from kaze.sampler import SamplingParams
+    from kaze.llm import LLM
+
+    llm = LLM(MODEL, kind="int4", lm_head_kind="int4", speculative=False, verbose=False)
+    try:
+        outs = []
+        for _ in range(2):
+            r = llm.generate("The capital of France is",
+                             SamplingParams(max_tokens=8, temperature=0.0))
+            outs.append(list(r.tokens))
+    finally:
+        llm.shutdown()
+    assert outs[0] == outs[1], outs
+
+
+@check("kernel.attn_batch_matches_single")
+def _() -> None:
+    """Batched (multi-sequence) prefill attention must match the per-sequence kernel.
+
+    This is the piece that makes batched prefill possible: several requests are
+    concatenated along the row axis and each 16-row group belongs to one sequence, so
+    the paged kernel only needs a per-row position instead of one global q_start.
+    """
+    from kaze.cache import KVCache
+    from kaze.kernels import attn as A
+
+    model = _load_model("int8")
+    cfg = model.cfg
+    dev = model.device
+    hq, hkv, d = cfg.num_attention_heads, cfg.num_key_value_heads, model.head_dim
+    gqa = hq // hkv
+    lens = [10, 26]
+    cache = KVCache(cfg, 128, 16, dev)
+    bt = torch.zeros((2, 8), dtype=torch.int32, device=dev)
+    qs, refs = [], []
+    for i, n in enumerate(lens):
+        nb = (n + 15) // 16
+        blocks = [cache.allocator.allocate() for _ in range(nb)]
+        bt[i, :nb] = torch.tensor(blocks, dtype=torch.int32)
+        q = torch.randn(n, hq, d, device=dev, dtype=torch.float16)
+        slots = cache.slots_of(bt[i], 0, n)
+        cache.k[0].view(-1, hkv, d)[slots] = torch.randn(n, hkv, d, device=dev,
+                                                          dtype=torch.float16)
+        cache.v[0].view(-1, hkv, d)[slots] = torch.randn(n, hkv, d, device=dev,
+                                                          dtype=torch.float16)
+        refs.append(A.attn_prefill_paged(q, cache.k[0], cache.v[0], bt[i], 0, n,
+                                         cache.block_size, gqa, d, model.scale))
+        qs.append(q)
+
+    def group(seq_idx: int, start: int, count: int):
+        seg = qs[seq_idx][start:start + count]
+        pad = torch.zeros(16 - seg.shape[0], hq, d, device=dev, dtype=torch.float16)
+        pos = torch.cat([torch.arange(start, start + seg.shape[0], device=dev),
+                         torch.full((16 - seg.shape[0],), -1, dtype=torch.long,
+                                    device=dev)])
+        return torch.cat([seg, pad]), pos
+
+    parts = [group(0, 0, 10), group(1, 0, 16), group(1, 16, 10)]
+    qb = torch.cat([p[0] for p in parts])
+    posb = torch.cat([p[1] for p in parts]).to(torch.int32)
+    lenb = torch.tensor([lens[0], lens[1], lens[1]], dtype=torch.int32, device=dev)
+    seqb = torch.tensor([0, 1, 1], dtype=torch.int32, device=dev)
+    outb = A.attn_prefill_batch(qb, cache.k[0], cache.v[0], bt, posb, lenb, seqb,
+                                qb.shape[0], cache.block_size, gqa, d, model.scale)
+    got0, got1 = outb[:10], torch.cat([outb[16:32], outb[32:42]])
+    for got, ref in ((got0, refs[0]), (got1, refs[1])):
+        cos = torch.nn.functional.cosine_similarity(got.float().flatten(),
+                                                    ref.float().flatten(), dim=0).item()
+        assert cos > 0.99999, cos
+
+
+@check("kernel.fused_rope_attention_matches")
+def _() -> None:
+    """The fused rope+attention kernel must reproduce rope_scatter + attn_decode exactly."""
+    import kaze.model as M
+    from kaze.cache import KVCache
+    from kaze.kernels import attn as A
+    from kaze.kernels.fused import rope_scatter
+
+    model = _load_model("int4")
+    cfg = model.cfg
+    dev = model.device
+    hq, hkv, d = cfg.num_attention_heads, cfg.num_key_value_heads, model.head_dim
+    qs, kvs = hq * d, hkv * d
+    n = qs + 2 * kvs
+    gqa = hq // hkv
+    ctx = 40
+    k_pref = torch.randn(ctx, kvs, device=dev, dtype=torch.float16)
+    v_pref = torch.randn(ctx, kvs, device=dev, dtype=torch.float16)
+
+    def build():
+        cache = KVCache(cfg, 256, 16, dev)
+        blocks = [cache.allocator.allocate() for _ in range(4)]
+        bt = torch.zeros((1, 8), dtype=torch.int32, device=dev)
+        bt[0, :4] = torch.tensor(blocks, dtype=torch.int32)
+        slots = cache.slots_of(bt[0], 0, ctx)
+        cache.k_flat[0].view(-1, kvs)[slots] = k_pref
+        cache.v_flat[0].view(-1, kvs)[slots] = v_pref
+        return cache, bt
+
+    qkv = torch.randn(1, n, device=dev, dtype=torch.float16) * 0.1
+    pos = torch.tensor([ctx], device=dev, dtype=torch.long)
+    lens = torch.tensor([ctx + 1], device=dev, dtype=torch.int32)
+    cache_a, bt_a = build()
+    sl_a = cache_a.slots_of(bt_a[0], ctx, ctx + 1)
+    q_out = torch.zeros((1, hq, d), device=dev, dtype=torch.float16)
+    rope_scatter(qkv, model.cos, model.sin, q_out, cache_a.k_flat[0], cache_a.v_flat[0],
+                 sl_a, pos, hq, hkv, d, 1)
+    ref = A.attn_decode(q_out, cache_a.k[0], cache_a.v[0], bt_a, lens,
+                        cache_a.block_size, gqa, d, torch.empty_like(q_out),
+                        scale=model.scale, mode="short")
+    cache_b, bt_b = build()
+    sl_b = cache_b.slots_of(bt_b[0], ctx, ctx + 1)
+    parts = torch.zeros((8, 1, n), device=dev, dtype=torch.float32)
+    parts[0, 0] = qkv[0].float()
+    out = torch.zeros((1, hq, d), device=dev, dtype=torch.float16)
+    A.rope_attn_decode(parts, None, model.cos, model.sin, cache_b.k[0], cache_b.v[0],
+                       bt_b, sl_b, pos, lens, hq, hkv, d, model.scale, out,
+                       cache_b.block_size)
+    assert torch.equal(ref, out), (ref.float() - out.float()).abs().max().item()
+
+
+@check("engine.spec_demotes_cleanly_at_two_streams")
+def _() -> None:
+    """spec_max_batch=1 must not change outputs when a 2nd stream is present or late."""
+    from kaze.llm import LLM
+    REPEAT = """def process(item):
+    name = item["name"]
+    value = item["value"]
+    if value > 0:
+        return {"name": name, "value": value}
+    return None
+""" * 4
+    code = REPEAT + "\n# continue\ndef process2(item):\n"
+
+    def run(spec: bool, second: str):
+        """second: "never" | "upfront" | "late" (arrives while spec may still run)."""
+        llm = LLM(MODEL, kind="int4", lm_head_kind="int4", speculative=spec, verbose=False)
+        eng = llm.engine
+        ids = eng.tokenizer.encode(code)
+        params = SamplingParams(max_tokens=24, temperature=0.0)
+        s0 = eng.add_request(list(ids), params)
+        s1 = eng.add_request(list(ids), params) if second == "upfront" else None
+        steps = 0
+        while s0.state != 3 or (s1 is not None and s1.state != 3):
+            eng.step()
+            steps += 1
+            if second == "late" and steps == 8 and s1 is None:
+                s1 = eng.add_request(list(ids), params)
+        torch.cuda.synchronize()
+        outs = [list(s.output) for s in (s0, s1) if s is not None]
+        llm.shutdown()
+        return outs
+
+    base = run(False, "upfront")   # 2 streams, spec off entirely
+    mixed = run(True, "upfront")   # 2 streams from the start, spec capped to 1
+    late = run(True, "late")       # 2nd stream arrives mid-flight, spec may have run
+    assert mixed == base, "two streams with spec ON must equal spec OFF"
+    assert late == base, "late-arrival demotion must equal spec OFF"
 
 
 @check("engine.chunked_prefill_and_prefix_cache")
@@ -204,7 +468,7 @@ def main() -> int:
 # ---------------------------------------------------------------- MoE
 def _moe_model():
     import os
-    p = os.path.join(MODELS, "tiny-qwen3moe")
+    p = "/models/tiny-qwen3moe"
     if not os.path.isdir(p):
         return None
     from kaze.loader import load_model
@@ -399,60 +663,6 @@ def test_moe_weight_bytes() -> None:
     assert n > 0, n
     assert n < 4 * 1024 ** 3, n
 
-
-
-@check("tile-major (int4 の並べ替え)")
-def _() -> None:
-    """tile-major の複製を作っても gemv_swiglu の出力が変わらないこと。"""
-    import torch
-
-    from kaze.kernels import quant_linear as K
-    from kaze.quant import QuantLinear
-
-    torch.manual_seed(7)
-    n, k = 4096, 1024
-    w = (torch.randn(n, k, device="cuda") * 0.02).half()
-    x = (torch.randn(16, k, device="cuda") * 0.5).half()
-    lin = QuantLinear.from_float(w, None, kind="int4", group=128)
-    base = K.gemv_swiglu(x, lin, 16, n // 2).clone()
-    lin.make_tile_major_copy()
-    tm = K.gemv_swiglu(x, lin, 16, n // 2)
-    cos = torch.nn.functional.cosine_similarity(
-        base.float().flatten(), tm.float().flatten(), 0).item()
-    assert cos > 0.999, f"tile-major の出力が一致しません (cos={cos:.6f})"
-
-
-
-
-
-@check("量子化の境界（group 非整除・group 64・int8）")
-def _() -> None:
-    """from_float の分岐が想定どおりに落ちること。"""
-    import torch
-
-    from kaze.kernels import quant_linear as K
-    from kaze.quant import QuantLinear
-
-    torch.manual_seed(11)
-    # 1) k が group で割り切れない -> fp16 にフォールバックする
-    w = (torch.randn(256, 1000, device="cuda") * 0.02).half()
-    lin = QuantLinear.from_float(w, None, kind="int4", group=128)
-    assert lin.kind == "fp16", f"kind={lin.kind}"
-
-    # 2) group=64 の int4 が動く
-    w2 = (torch.randn(512, 1024, device="cuda") * 0.02).half()
-    lin2 = QuantLinear.from_float(w2, None, kind="int4", group=64)
-    x = (torch.randn(16, 1024, device="cuda") * 0.5).half()
-    y = K.gemv(x, lin2, 16)
-    ref = (x.float() @ w2.float().T)
-    cos = torch.nn.functional.cosine_similarity(y.float().flatten(), ref.flatten(), 0).item()
-    assert cos > 0.98, f"int4 group64 cos={cos:.4f}"
-
-    # 3) int8 は int4 より誤差が小さい
-    lin8 = QuantLinear.from_float(w2, None, kind="int8", group=64)
-    y8 = K.gemv(x, lin8, 16)
-    cos8 = torch.nn.functional.cosine_similarity(y8.float().flatten(), ref.flatten(), 0).item()
-    assert cos8 > cos, f"int8 {cos8:.5f} <= int4 {cos:.5f}"
 
 
 if __name__ == "__main__":

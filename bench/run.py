@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import statistics
 import time
+from pathlib import Path
 
 import torch
 
@@ -26,6 +27,8 @@ def _tokens(n: int) -> list[int]:
 
 
 def bench_prefill(llm, lengths=(128, 512, 2048), repeats=3) -> dict[str, float]:
+    if repeats <= 0 or any(n <= 0 for n in lengths):
+        raise ValueError("prefill lengths and repeats must be positive")
     out = {}
     eng = llm.engine
     for n in lengths:
@@ -43,6 +46,8 @@ def bench_prefill(llm, lengths=(128, 512, 2048), repeats=3) -> dict[str, float]:
 
 
 def bench_decode(llm, prompt_len=64, gen_len=128, repeats=3) -> dict[str, float]:
+    if prompt_len <= 0 or gen_len < 2 or repeats <= 0:
+        raise ValueError("decode requires a positive prompt, repeats, and at least 2 output tokens")
     eng = llm.engine
     nodec = []
     for _ in range(repeats):
@@ -66,6 +71,8 @@ def bench_decode(llm, prompt_len=64, gen_len=128, repeats=3) -> dict[str, float]
 
 
 def bench_concurrency(llm, levels=(1, 2, 4, 8, 16, 32), prompt_len=128, gen_len=64) -> dict:
+    if prompt_len <= 0 or gen_len <= 0 or any(n <= 0 for n in levels):
+        raise ValueError("concurrency levels and token lengths must be positive")
     eng = llm.engine
     rows = {}
     for n in levels:
@@ -87,7 +94,7 @@ def bench_concurrency(llm, levels=(1, 2, 4, 8, 16, 32), prompt_len=128, gen_len=
 
 def run_bench(llm, args) -> None:
     print("== prefill ==")
-    pre = bench_prefill(llm)
+    pre = bench_prefill(llm, lengths=(args.prompt_len,), repeats=args.repeats)
     for k, v in pre.items():
         print(f"  {k:22s} {v:12.1f}")
     print("== decode (batch 1) ==")
@@ -95,12 +102,13 @@ def run_bench(llm, args) -> None:
     for k, v in dec.items():
         print(f"  {k:22s} {v:12.2f}")
     print("== concurrency ==")
-    con = bench_concurrency(llm)
+    con = bench_concurrency(llm, levels=(args.concurrency,),
+                            prompt_len=args.prompt_len, gen_len=args.gen_len)
     for n, row in con.items():
         print(f"  n={n:3d}  agg={row['agg_tok_s']:8.1f} tok/s   "
               f"per-stream={row['per_stream_tok_s']:7.1f} tok/s   wall={row['wall_s']:.2f}s")
     out = {"prefill": pre, "decode": dec, "concurrency": con,
            "model_bytes": llm.model.weight_bytes(), "peak_bw_gbs": PEAK_BW_GBS}
-    with open("bench/results.json", "w") as f:
+    with open(Path(__file__).resolve().with_name("results.json"), "w") as f:
         json.dump(out, f, indent=1)
     print("wrote bench/results.json")

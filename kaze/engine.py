@@ -14,11 +14,13 @@ and any still-cached prefix is reused by the prefix cache).
 """
 from __future__ import annotations
 
+import os
 import re
 import threading
 import time
 import uuid
 from dataclasses import dataclass, field
+from numbers import Integral
 from typing import Callable, Iterable
 
 import torch
@@ -40,6 +42,7 @@ class RequestOutput:
     finish_reason: str | None = None
     ttft_ms: float | None = None
     tpot_ms: float | None = None
+    error: str | None = None
 
 
 LOOKUP_MIN = 2
@@ -58,6 +61,7 @@ class Sequence:
         self.output: list[int] = []
         self._all: list[int] = list(self.prompt)
         self.params = params
+        self.generator: torch.Generator | None = None
         self.blocks: list[int] = []
         self.hashes: list[int] = []
         self.num_computed = 0
@@ -67,8 +71,13 @@ class Sequence:
         self.last_token_time: float | None = None
         self.itls: list[float] = []
         self.finish_reason: str | None = None
+        self.error: str | None = None
         self.text_so_far = ""
         self.bt: torch.Tensor | None = None
+        # pinned CPU mirror of the block table: the decode step uploads it every token and
+        # a GPU->CPU copy per step was a blocking sync (bench/host_overhead.py)
+        self.bt_cpu: torch.Tensor | None = None
+        self.bt_ver = 0
         # draft-model speculation: the drafter keeps its own KV cache, so we remember
         # how many positions of this sequence are already in it (positions beyond it are
         # recomputed because a rejected draft leaves stale entries there)
@@ -272,6 +281,13 @@ class Engine:
                  use_draft_model: bool = False,
                  spec_accept_ema: float = 1.0, cache_dtype: str = "fp16",
                  draft_model: "KazeModel | None" = None):
+        for name, value in (("block_size", block_size), ("max_batch", max_batch),
+                            ("max_batched_tokens", max_batched_tokens), ("spec_k", spec_k),
+                            ("num_blocks", num_blocks), ("max_model_len", max_model_len)):
+            if value is None and name in ("num_blocks", "max_model_len"):
+                continue
+            if isinstance(value, bool) or not isinstance(value, Integral) or value <= 0:
+                raise ValueError(f"{name} must be a positive integer")
         self.model = model
         self.cfg: ModelConfig = model.cfg
         self.tokenizer = tokenizer
@@ -327,8 +343,32 @@ class Engine:
             "fp8v": (_f16, torch.float8_e5m2),
         }
         _kd, _vd = _kinds.get(cache_dtype, (_f16, _f16))
+        if cache_dtype == "fp8":
+            # quantising the keys costs long-range recall: measured 2026-11-16 on 0.5B int4,
+            # needle-in-a-haystack MISSes at both 4K and 16K ("The passkey is 739" instead of
+            # 7391) while fp8v (K fp16, V fp8) hits at both.  Say so instead of letting it
+            # degrade silently.
+            import warnings
+            warnings.warn(
+                "--cache-dtype fp8 quantises the keys too and measurably breaks long-range "
+                "recall (needle MISS at 4K and 16K). Use fp8v for 25% KV savings without "
+                "the recall loss.", stacklevel=3)
         self.cache = KVCache(self.cfg, num_blocks, block_size, model.device,
                              dtypes=(_kd, _vd))
+        # Clamp max_batch to what the KV pool can actually sustain.  Paged KV never fails
+        # outright, but admitting far more sequences than the pool holds collapses
+        # throughput instead of queueing: 7B at 128 streams measured 557 tok/s (14.7 s wall)
+        # against 2,146 tok/s at 64, because every sequence fights over the same 564 blocks.
+        # Four blocks per sequence (64 tokens at block_size 16) is the smallest reserve that
+        # still lets a request decode; anything larger simply queues instead of thrashing.
+        _sustainable = max(1, self.cache.num_blocks // 4)
+        if max_batch > _sustainable:
+            import warnings
+            warnings.warn(
+                f"max_batch {max_batch} exceeds what the KV pool can sustain "
+                f"({_sustainable} sequences of 8 blocks); clamping to {_sustainable}",
+                stacklevel=2)
+            self.max_batch = _sustainable
         # a second, independent cache for the draft model: it has its own head layout, so
         # it cannot share blocks with the target
         self.draft_model = draft_model
@@ -342,7 +382,11 @@ class Engine:
         cap = 16
         while cap < max_batch:
             cap *= 2
-        self.buckets = [b for b in (16, 32, 64, 128, 256) if b <= cap] or [16]
+        # 1 is its own bucket: a single stream is the common case, and the decode kernels
+        # have a matvec path for TDIM=1 that reads one row of X instead of 16 (see
+        # kernels/quant_linear.py).  Every other batch shares the 16+ buckets because
+        # tl.dot needs 16 rows; without this the matvec path could never be captured.
+        self.buckets = [1] + ([b for b in (16, 32, 64, 128, 256) if b <= cap] or [16])
         self.graphs: dict[tuple[int, str], torch.cuda.CUDAGraph] = {}
         self.static: dict[int, dict[str, torch.Tensor]] = {}
         self.waiting: list[Sequence] = []
@@ -368,8 +412,20 @@ class Engine:
         # start pessimistic: a fresh workload is usually prose, and the first
         # wide verification on text that never repeats is pure overhead
         self._accept_ema = spec_accept_ema
-        self.spec_max_batch = 2       # beyond this, batched decode wins without drafts
+        # Speculation only pays at a single sequence: measured with the current kernels on a
+        # repetitive task, 1 stream 715 -> 1398 tok/s (1.95x) but 2 streams 1034 -> 953
+        # (0.92x) and 4 streams neutral, because verification scales with the row count
+        # while plain batched decode does not.
+        self.spec_max_batch = 1
         self.attn_mode_override = None   # "short" / "long", for A/B measurements
+        # Batch the prefill chunks of several queued requests into one forward.  A burst
+        # that shares a prompt ends up needing only its last block per request, and one
+        # 16-row forward per request is pure launch overhead (measured 0.36 s for 31).
+        self.batched_prefill = os.environ.get("KAZE_BATCHED_PREFILL", "1") != "0"
+        # 32 measured best on a 32-request burst (cap 4/8/16/32 -> 0.114/0.074/0.059/0.042 s);
+        # the row count stays bounded by batched_prefill_chunk and the step budget
+        self.batched_prefill_max = int(os.environ.get("KAZE_BATCHED_PREFILL_MAX", "32"))
+        self.batched_prefill_chunk = 1024
         self.attn_block_n = 128          # 256 measured neutral, kept as a knob
         self._spec_probe = 0
         self.stats = {"steps": 0, "prefill_tokens": 0, "decode_tokens": 0,
@@ -399,7 +455,19 @@ class Engine:
     def add_request(self, prompt: list[int] | torch.Tensor, params: SamplingParams | None = None,
                     request_id: str | None = None) -> Sequence:
         ids = prompt.tolist() if isinstance(prompt, torch.Tensor) else list(prompt)
-        seq = Sequence(ids[: self.max_model_len], params or SamplingParams(), request_id)
+        if not isinstance(ids, list) or any(
+                isinstance(token, bool) or not isinstance(token, Integral)
+                or not 0 <= token < self.cfg.vocab_size for token in ids):
+            raise ValueError("Prompt token IDs must be integers in the model vocabulary")
+        if not ids:
+            raise ValueError("Prompt must contain at least one token")
+        ids = ids[:self.max_model_len]
+        if blocks_for(len(ids), self.block_size) > self.cache.num_blocks:
+            raise ValueError("Prompt exceeds KV cache capacity")
+        seq = Sequence(ids, params.clone() if params is not None else SamplingParams(), request_id)
+        if seq.params.seed is not None:
+            seq.generator = torch.Generator(device=self.model.device)
+            seq.generator.manual_seed(seq.params.seed)
         if self.speculative:
             seq.build_index()
         self.waiting.append(seq)
@@ -407,15 +475,26 @@ class Engine:
 
     def _ensure_blocks(self, seq: Sequence, upto: int, reserve: int = 0) -> bool:
         need = blocks_for(upto, self.block_size) + reserve
+        original = len(seq.blocks)
         while len(seq.blocks) < need:
             try:
                 blk = self.cache.allocator.allocate()
             except MemoryError:
+                for block in seq.blocks[original:]:
+                    self.cache.allocator.release(block)
+                if seq.bt is not None:
+                    seq.bt[original:len(seq.blocks)].zero_()
+                del seq.blocks[original:]
+                del seq.hashes[original:]
                 return False
             if seq.bt is None:
                 seq.bt = torch.zeros(self.max_blocks_per_seq, dtype=torch.int32,
                                      device=self.model.device)
+                seq.bt_cpu = torch.zeros(self.max_blocks_per_seq, dtype=torch.int32,
+                                         pin_memory=True)
             seq.bt[len(seq.blocks)] = blk
+            seq.bt_cpu[len(seq.blocks)] = blk
+            seq.bt_ver += 1
             seq.blocks.append(blk)
             seq.hashes.append(0)
         return True
@@ -424,7 +503,8 @@ class Engine:
         if not self.enable_prefix_cache:
             return
         parent = 0
-        n_full = len(seq.prompt) // self.block_size
+        # Keep the last token private: its forward recovers logits and writes KV.
+        n_full = (len(seq.prompt) - 1) // self.block_size
         matched = 0
         for i in range(n_full):
             toks = seq.prompt[i * self.block_size:(i + 1) * self.block_size]
@@ -436,7 +516,11 @@ class Engine:
             if seq.bt is None:
                 seq.bt = torch.zeros(self.max_blocks_per_seq, dtype=torch.int32,
                                      device=self.model.device)
+                seq.bt_cpu = torch.zeros(self.max_blocks_per_seq, dtype=torch.int32,
+                                         pin_memory=True)
             seq.bt[len(seq.blocks)] = blk
+            seq.bt_cpu[len(seq.blocks)] = blk
+            seq.bt_ver += 1
             seq.blocks.append(blk)
             seq.hashes.append(h)
             parent = h
@@ -470,6 +554,11 @@ class Engine:
         seq.blocks.clear()
         seq.hashes.clear()
         seq.num_computed = 0
+        if seq.draft_blocks is not None:
+            for blk in seq.draft_blocks:
+                self.draft_cache.allocator.release(blk)
+            seq.draft_blocks = None
+        seq.draft_len = 0
 
     def _preempt(self) -> bool:
         if len(self.running) <= 1:
@@ -658,8 +747,15 @@ class Engine:
         if seq.draft_blocks is None:
             seq.draft_blocks = []
         need_blocks = (P + k) // self.block_size + 2
-        while len(seq.draft_blocks) < need_blocks:
-            seq.draft_blocks.append(dc.allocator.allocate())
+        original = len(seq.draft_blocks)
+        try:
+            while len(seq.draft_blocks) < need_blocks:
+                seq.draft_blocks.append(dc.allocator.allocate())
+        except MemoryError:
+            for block in seq.draft_blocks[original:]:
+                dc.allocator.release(block)
+            del seq.draft_blocks[original:]
+            return []
         bt = dc.block_table_tensor(seq.draft_blocks, len(seq.draft_blocks))
         if bt.dim() == 1:
             bt = bt.view(1, -1)
@@ -715,8 +811,15 @@ class Engine:
             if K > self.spec_plan[-1][0]:
                 K, tdim = self.spec_plan[-1]
         elif want > 8:
-            K, tdim = min(self.spec_plan[-2][0], 16), 16
+            # spec_plan may hold a single width if a caller overrides it
+            second = self.spec_plan[-2][0] if len(self.spec_plan) > 1 else self.spec_plan[-1][0]
+            K, tdim = min(second, 16), 16
         else:
+            K, tdim = min(self.spec_plan[0][0], 8), 16
+        # Wide verification only pays when the drafter really hits: measured on a 0.5B,
+        # repetitive code 4.75x at width 16 vs 3.22x at 8, but prose 1.44x vs 1.52x.  The
+        # acceptance EMA (tokens emitted per step) tells the two apart.
+        if K > 8 and self._accept_ema < 2.0:
             K, tdim = min(self.spec_plan[0][0], 8), 16
         P = seq.num_computed
         if P <= 0 or P >= len(seq.tokens) or P + K > self.max_model_len:
@@ -767,6 +870,7 @@ class Engine:
         if seq.first_token_time is None:
             seq.first_token_time = now
         reason = None
+        output_start = len(seq.output)
         for tok in new_tokens:
             seq.output.append(tok)
             seq._index(len(seq.tokens) - 1)
@@ -785,8 +889,9 @@ class Engine:
                 self.running.remove(seq)
             self._free(seq)
         self.stats["spec_steps"] += 1
-        self.stats["spec_tokens"] += m
-        self._accept_ema = 0.5 * self._accept_ema + 0.5 * m
+        emitted = len(seq.output) - output_start
+        self.stats["spec_tokens"] += emitted
+        self._accept_ema = 0.5 * self._accept_ema + 0.5 * emitted
         return True
 
     def _spec_decode_chains(self, seq: Sequence, outs: list[RequestOutput]) -> bool:
@@ -829,11 +934,9 @@ class Engine:
             if off:
                 src = self.cache.k[:, real, :off]
                 dst_idx = torch.tensor(scratch, dtype=torch.long, device=self.cache.device)
-                dst = self.cache.k[:, dst_idx, :off]
-                dst.copy_(src.unsqueeze(1).expand_as(dst))
+                self.cache.k[:, dst_idx, :off] = src.unsqueeze(1)
                 src_v = self.cache.v[:, real, :off]
-                dst_v = self.cache.v[:, dst_idx, :off]
-                dst_v.copy_(src_v.unsqueeze(1).expand_as(dst_v))
+                self.cache.v[:, dst_idx, :off] = src_v.unsqueeze(1)
 
             ids_l, pos_l, slot_l, groups = [], [], [], []
             for c, cont in enumerate(chains):
@@ -892,6 +995,7 @@ class Engine:
             seq.last_token_time = now
             if seq.first_token_time is None:
                 seq.first_token_time = now
+            output_start = len(seq.output)
             for tok in best_tokens:
                 seq.output.append(tok)
                 seq._index(len(seq.tokens) - 1)
@@ -910,8 +1014,9 @@ class Engine:
                     self.running.remove(seq)
                 self._free(seq)
             self.stats["spec_steps"] += 1
-            self.stats["spec_tokens"] += best_m
-            self._accept_ema = 0.5 * self._accept_ema + 0.5 * best_m
+            emitted = len(seq.output) - output_start
+            self.stats["spec_tokens"] += emitted
+            self._accept_ema = 0.5 * self._accept_ema + 0.5 * emitted
             return True
         finally:
             for x in scratch:
@@ -1011,6 +1116,7 @@ class Engine:
             s.last_token_time = now
             if s.first_token_time is None:
                 s.first_token_time = now
+            output_start = len(s.output)
             for tok in new_tokens:
                 s.output.append(tok)
                 s._index(len(s.tokens) - 1)
@@ -1029,7 +1135,7 @@ class Engine:
                     self.running.remove(s)
                 self._free(s)
             self.stats["spec_steps"] += 1
-            self.stats["spec_tokens"] += m
+            self.stats["spec_tokens"] += len(s.output) - output_start
         return True
 
     def _decode_step(self, outs: list[RequestOutput]) -> None:
@@ -1043,7 +1149,10 @@ class Engine:
         # verification scales with the row count while plain batched decode does not,
         # so speculation only pays at low concurrency (measured: 5.3x at batch 1,
         # 1.1x at 4, 0.74x -- a regression -- at 8)
-        if self.speculative and seqs and want_spec and len(seqs) <= self.spec_max_batch:
+        # Verification uses raw argmax; penalties require the regular sampler.
+        if (self.speculative and seqs and want_spec and len(seqs) <= self.spec_max_batch
+                and all(s.params.repetition_penalty == 1.0
+                        and s.params.presence_penalty == 0.0 for s in seqs)):
             if len(seqs) == 1 and seqs[0].params.temperature <= 0:
                 if self._spec_decode_chains(seqs[0], outs):
                     return
@@ -1054,17 +1163,30 @@ class Engine:
                     return
         room = []
         for s in seqs:
-            if not self._ensure_blocks(s, s.num_computed + 1):
+            # A victim may still be in this step's snapshot. Retry allocation
+            # after each preemption and never decode a freed sequence.
+            while s.state == DECODE:
+                if self._ensure_blocks(s, s.num_computed + 1):
+                    room.append(s)
+                    break
                 if not self._preempt():
-                    continue
-            room.append(s)
-        seqs = room
+                    # No victim can make progress: terminate this request, not the worker.
+                    s.state = DONE
+                    s.finish_reason = "error"
+                    s.error = "KV cache exhausted"
+                    self.running.remove(s)
+                    self._free(s)
+                    outs.append(RequestOutput(s.request_id, [], s.text_so_far, True,
+                                              finish_reason="error", error=s.error))
+                    break
+        seqs = [s for s in room if s.state == DECODE]
         if not seqs:
             return
         b = len(seqs)
         tdim = next((t for t in self.buckets if t >= b), self.buckets[-1])
         st = self._static(tdim)
         bs = self.block_size
+        rows4 = st["rows"]
         ids = st["ids"]
         pos = st["positions"]
         slots = st["slots"]
@@ -1078,13 +1200,48 @@ class Engine:
         pos_l = [s.num_computed for s in use]
         slot_l = [s.blocks[s.num_computed // bs] * bs + s.num_computed % bs for s in use]
         dev = self.model.device
-        ids[:n_real].copy_(torch.tensor(id_l, dtype=torch.long, device=dev))
-        pos[:n_real].copy_(torch.tensor(pos_l, dtype=torch.long, device=dev))
-        slots[:n_real].copy_(torch.tensor(slot_l, dtype=torch.long, device=dev))
-        lens[:n_real].fill_(0)
-        lens[:n_real].copy_(torch.tensor([s.num_computed + 1 for s in use],
-                                         dtype=torch.int32, device=dev))
-        bt[:n_real].copy_(torch.stack([s.bt for s in use]))
+        h_rows = st["h_rows"]
+        if h_rows is not None:
+            # one pinned upload for ids+positions+slots, one for the lengths, and the block
+            # table only when a sequence actually allocated (it changes every 16 tokens)
+            if n_real == 1:
+                s0 = use[0]
+                h_rows[0, 0] = id_l[0]
+                h_rows[1, 0] = pos_l[0]
+                h_rows[2, 0] = slot_l[0]
+                st["h_lens"][0] = s0.num_computed + 1
+                # re-upload only when this sequence grew (key on identity + version, so a
+                # new request with the same version still uploads)
+                key = (s0.request_id, s0.bt_ver)
+                if st.get("bt_key") != key:
+                    st["h_bt"][0] = s0.bt_cpu
+                    bt[0].copy_(st["h_bt"][0], non_blocking=True)
+                    st["bt_key"] = key
+                if n_real < tdim:
+                    h_rows[:, n_real:].zero_()
+                    st["h_lens"][n_real:] = 1
+            else:
+                h_rows[0, :n_real] = torch.tensor(id_l, dtype=torch.long)
+                h_rows[1, :n_real] = torch.tensor(pos_l, dtype=torch.long)
+                h_rows[2, :n_real] = torch.tensor(slot_l, dtype=torch.long)
+                st["h_lens"][:n_real] = torch.tensor([s.num_computed + 1 for s in use],
+                                                     dtype=torch.int32)
+                st["h_bt"][:n_real] = torch.stack([s.bt_cpu for s in use])
+                bt[:n_real].copy_(st["h_bt"][:n_real], non_blocking=True)
+                if n_real < tdim:
+                    h_rows[:, n_real:].zero_()
+                    st["h_lens"][n_real:] = 1
+                    bt[n_real:].zero_()
+            rows4.copy_(h_rows, non_blocking=True)
+            lens.copy_(st["h_lens"], non_blocking=True)
+        else:
+            ids[:n_real].copy_(torch.tensor(id_l, dtype=torch.long, device=dev))
+            pos[:n_real].copy_(torch.tensor(pos_l, dtype=torch.long, device=dev))
+            slots[:n_real].copy_(torch.tensor(slot_l, dtype=torch.long, device=dev))
+            lens[:n_real].fill_(0)
+            lens[:n_real].copy_(torch.tensor([s.num_computed + 1 for s in use],
+                                             dtype=torch.int32, device=dev))
+            bt[:n_real].copy_(torch.stack([s.bt for s in use]))
         if n_real < tdim:
             ids[n_real:].zero_()
             pos[n_real:].zero_()
@@ -1092,63 +1249,184 @@ class Engine:
             lens[n_real:].fill_(1)
             bt[n_real:].zero_()
         max_len = max((s.num_computed for s in seqs), default=1)
-        mode = self.attn_mode_override or ("short" if max_len <= 1024 else "long")
-        if getattr(self.cache, "q8", False):
-            # only the direct (single-pass) kernel knows how to apply the int8 scales
-            mode = "short"
+        # The split-K path wins from ~256 tokens up (0.5B int4, same process: ctx 256 794
+        # vs 748, 512 821 vs 698, 1024 787 vs 597, 2048 749 vs 453 tok/s), so the old
+        # "direct kernel below 1024" rule was leaving 13-32% on the table.  Below that the
+        # two are equal (ctx 16 / 128) except at 64 where the direct kernel is 5% ahead,
+        # and it is still the only one that applies int8 KV scales.
+        q8 = getattr(self.cache, "q8", False)
+        mode = self.attn_mode_override or ("short" if (q8 or max_len <= 128) else "long")
         graph = self.graphs.get((tdim, mode))
         if self.use_cuda_graph and graph is not None:
             graph.replay()
-            logits = st["out"][:n_real].clone()
+            # no clone: sampling runs on the same stream before the next replay, so the
+            # graph's output buffer is still intact when it is read (it was 10 us/step at
+            # batch 1 and 24 us at batch 32 in the DtoD copy)
+            logits = st["out"][:n_real]
         else:
             logits = self.model.decode_logits(ids, pos, slots, bt, lens, self.cache,
-                                              tdim=tdim, attn_mode=mode).clone()[:n_real]
+                                              tdim=tdim, attn_mode=mode)[:n_real]
         for s in seqs[:n_real]:
             s.num_computed += 1      # the token fed this step now has its KV cached
         self._sample_and_append(seqs[:n_real], logits, outs)
         self.stats["decode_tokens"] += n_real
 
+    def _try_batched_prefill(self, outs: list[RequestOutput], budget: int) -> int:
+        """Prefill several queued requests in one forward.
+
+        A burst of requests that share a prompt all end up needing just their last block
+        (the prefix cache covers the rest), so the step used to run one 16-row forward per
+        request: 31 of them cost 0.36 s, dominated by per-launch cost rather than math.
+        Concatenating those chunks along the row axis makes it one forward.  Long prompts
+        that cannot finish in the budget are batched too and simply continue next step.
+
+        Each chunk is a whole number of cache blocks, so no padding rows are ever written
+        into the KV cache.
+        """
+        if not getattr(self.model, "prefill_batched", None):
+            # CPU reference models (and the audit fakes) only implement the single-row
+            # prefill; batching would be wrong for them anyway.
+            return 0
+        if not self.batched_prefill or self.prefill_queue or not self._prefilled_this_step:
+            # Wait until this step has prefilled at least one request: until then the prefix
+            # cache is cold, and admitting the whole queue at once would make every request
+            # miss (measured: prefix_hits 217 -> 112, prefill tokens 624 -> 2304).
+            # Tried making this guard global instead of per step (round 162): no change to
+            # the 1.4 s burst step, so the per-step form is not what blocks batching there.
+            return 0
+        bs = self.block_size
+        cands: list[tuple[Sequence, int, bool]] = []
+        room = budget
+        skipped: list[Sequence] = []
+        for s in list(self.waiting):
+            if len(cands) >= self.batched_prefill_max:
+                break
+            if s in skipped:
+                continue
+            if not s.blocks:
+                self._match_prefix(s)
+            todo = s.num_tokens - s.num_computed
+            if todo <= 0:
+                continue
+            real = min(todo, room, self.batched_prefill_chunk)
+            if real <= 0:                  # budget exhausted; another step will take it
+                continue
+            if real < bs:
+                # Tail smaller than one block (a prefix hit usually leaves 1..bs-1
+                # tokens).  Pad it to one block so the request can ride the batched
+                # forward: attention reads only up to len_l (= start + real), and the
+                # padding rows land in a block that is never registered in the prefix
+                # cache, so nothing ever reads them.  Without this, a prompt whose
+                # length is not a multiple of block_size degenerated to one forward per
+                # request (7B, 32 identical 34-token prompts: 31 x 44 ms in a single
+                # step, measured in bench/burst_todo_probe.py).
+                chunk, real_len = bs, real
+            else:
+                chunk = real - real % bs
+                real_len = chunk
+            if chunk < bs:
+                continue
+            if not self._ensure_blocks(s, s.num_computed + chunk):
+                skipped.append(s)
+                continue
+            cands.append((s, chunk, real_len, real_len >= todo))
+            room -= chunk
+        if len(cands) < 2:
+            return 0
+        dev = self.model.device
+        ids_l, pos_l, slot_l, seq_l, len_l, last_l = [], [], [], [], [], []
+        bt_rows, starts = [], []
+        offset = 0
+        for idx, (s, chunk, real_len, finishes) in enumerate(cands):
+            start = s.num_computed
+            starts.append(start)
+            chunk_ids = s.tokens[start:start + real_len]
+            if chunk < len(chunk_ids):
+                raise AssertionError("padding chunk smaller than the real tokens")
+            if chunk > len(chunk_ids):          # padded tail (see the selection above)
+                chunk_ids = chunk_ids + [chunk_ids[-1]] * (chunk - len(chunk_ids))
+            ids_l.append(torch.tensor(chunk_ids, device=dev))
+            pos_l.append(torch.arange(start, start + chunk, device=dev))
+            slot_l.append(self.cache.slots_of(s.bt, start, start + chunk))
+            groups = chunk // bs
+            seq_l.extend([idx] * groups)
+            len_l.extend([start + real_len] * groups)
+            if finishes:
+                last_l.append(offset + real_len - 1)
+            offset += chunk
+            bt_rows.append(s.bt)
+        logits = self.model.prefill_batched(
+            torch.cat(ids_l), torch.cat(pos_l), torch.cat(slot_l), self.cache,
+            torch.stack(bt_rows),
+            torch.tensor(len_l, dtype=torch.int32, device=dev),
+            torch.tensor(seq_l, dtype=torch.int32, device=dev),
+            torch.tensor(last_l, device=dev))
+        total = 0
+        row = 0
+        for idx, (s, chunk, real_len, finishes) in enumerate(cands):
+            start = starts[idx]
+            s.num_computed = start + real_len      # padded rows are not real tokens
+            self._register_prefix(s, start, s.num_computed)
+            self.stats["prefill_tokens"] += real_len
+            total += real_len
+            if s in self.waiting:
+                self.waiting.remove(s)
+            if finishes:
+                self._finish_prefill(s, logits[row:row + 1], outs)
+                row += 1
+            else:
+                self.prefill_queue.append(s)
+        self.stats["batched_prefills"] = self.stats.get("batched_prefills", 0) + 1
+        return total
     def _prefill_step(self, outs: list[RequestOutput], budget: int) -> None:
         queue = self.prefill_queue
+        self._prefilled_this_step = False
         while budget > 0:
+            used = self._try_batched_prefill(outs, budget)
+            if used:
+                budget -= used
+                continue
             if queue:
                 seq = queue[0]
             elif self.waiting:
+                if len(self.running) >= self.max_batch:
+                    return
                 seq = self.waiting.pop(0)
                 if not seq.blocks:
                     self._match_prefix(seq)
-                if seq.num_computed >= len(seq.prompt):
+                if seq.num_computed >= seq.num_tokens:
                     # fully cached (prefix cache hit covered the whole prompt)
                     self._finish_prefill(seq, None, outs)
                     continue
                 if not self._ensure_blocks(seq, seq.num_computed + min(
-                        len(seq.prompt) - seq.num_computed, budget), reserve=1):
+                        seq.num_tokens - seq.num_computed, budget)):
                     self.waiting.insert(0, seq)
                     return
                 queue.append(seq)
             else:
                 return
-            remaining = len(seq.prompt) - seq.num_computed
+            remaining = seq.num_tokens - seq.num_computed
             if remaining <= 0:
                 self._finish_prefill(seq, None, outs)
                 queue.pop(0)
                 continue
             chunk = min(remaining, budget)
-            if not self._ensure_blocks(seq, seq.num_computed + chunk, reserve=1):
+            if not self._ensure_blocks(seq, seq.num_computed + chunk):
                 if queue and queue[0] is seq:
                     queue.pop(0)
                 self.waiting.insert(0, seq)
                 return
             start = seq.num_computed
             end = start + chunk
-            ids = torch.tensor(seq.prompt[start:end], device=self.model.device)
+            ids = torch.tensor(seq.tokens[start:end], device=self.model.device)
             positions = torch.arange(start, end, device=self.model.device)
             logits = self.model.prefill_logits(ids, positions, self.cache, seq.bt, start)
             seq.num_computed = end
             self._register_prefix(seq, start, end)
             self.stats["prefill_tokens"] += chunk
+            self._prefilled_this_step = True
             budget -= chunk
-            if seq.num_computed >= len(seq.prompt):
+            if seq.num_computed >= seq.num_tokens:
                 queue.pop(0) if queue and queue[0] is seq else None
                 self._finish_prefill(seq, logits, outs)
             else:
@@ -1159,10 +1437,10 @@ class Engine:
         if seq.state == DECODE:
             return          # idempotent: never finish the same sequence twice
         if logits is None:
-            # whole prompt was already cached: recompute the last token to get logits
-            start = len(seq.prompt) - 1
+            # Recompute the final cached token, including generated history after preemption.
+            start = seq.num_tokens - 1
             logits = self.model.prefill_logits(
-                torch.tensor([seq.prompt[-1]], device=self.model.device),
+                torch.tensor([seq.tokens[-1]], device=self.model.device),
                 torch.arange(start, start + 1, device=self.model.device),
                 self.cache, seq.bt, start)
         seq.state = DECODE
@@ -1173,9 +1451,12 @@ class Engine:
     def _sample_and_append(self, seqs: list[Sequence], logits: torch.Tensor,
                            outs: list[RequestOutput], first: bool = False) -> None:
         params = [s.params for s in seqs]
-        history = [s.tokens[-128:] for s in seqs]
+        history = ([s.tokens for s in seqs]
+                   if any(p.repetition_penalty != 1.0 or p.presence_penalty != 0.0
+                          for p in params) else None)
         # one host sync for the whole batch instead of one per sequence
-        toks = sample_rows(logits, params, history, self.generator).tolist()
+        toks = sample_rows(logits, params, history, self.generator,
+                           generators=[s.generator for s in seqs]).tolist()
         now = time.perf_counter()
         finished: list[Sequence] = []
         for s, tok in zip(seqs, toks):
@@ -1209,8 +1490,6 @@ class Engine:
 
     def _finish_reason(self, seq: Sequence, token: int) -> str | None:
         p = seq.params
-        if len(seq.output) >= p.max_tokens:
-            return "length"
         if token in self.eos_token_ids and not p.ignore_eos:
             return "stop"
         if p.stop_token_ids and token in p.stop_token_ids:
@@ -1220,7 +1499,7 @@ class Engine:
             for s in p.stop:
                 if s and s in text:
                     return "stop"
-        if seq.num_computed >= self.max_model_len:
+        if len(seq.output) >= p.max_tokens or len(seq.tokens) > self.max_model_len:
             return "length"
         return None
 
@@ -1229,14 +1508,29 @@ class Engine:
         st = self.static.get(tdim)
         if st is None:
             dev = self.model.device
+            # ids / positions / slots live in one [3, tdim] tensor: one async upload per
+            # step instead of three (the per-step copies were the whole host overhead)
+            rows = torch.zeros((3, tdim), dtype=torch.long, device=dev)
             st = {
-                "ids": torch.zeros(tdim, dtype=torch.long, device=dev),
-                "positions": torch.zeros(tdim, dtype=torch.long, device=dev),
-                "slots": torch.zeros(tdim, dtype=torch.long, device=dev),
+                "rows": rows,
+                "ids": rows[0],
+                "positions": rows[1],
+                "slots": rows[2],
                 "block_tables": torch.zeros((tdim, self.max_blocks_per_seq),
                                             dtype=torch.int32, device=dev),
                 "seq_lens": torch.ones(tdim, dtype=torch.int32, device=dev),
             }
+            # pinned staging for the per-step row uploads: a pageable H2D copy blocks the
+            # caller, and five of them per step were most of the 0.22 ms host overhead
+            # measured on batch 1 (bench/host_overhead.py)
+            try:
+                st["h_rows"] = torch.zeros((3, tdim), dtype=torch.long, pin_memory=True)
+                st["h_lens"] = torch.ones(tdim, dtype=torch.int32, pin_memory=True)
+                st["h_bt"] = torch.zeros((tdim, self.max_blocks_per_seq),
+                                         dtype=torch.int32, pin_memory=True)
+            except RuntimeError:            # no pinned allocator available
+                st["h_rows"] = None
+                st["h_lens"] = st["h_bt"] = None
             bufs = self.model.get_buffers(tdim)
             st["out"] = bufs.logits
             self.static[tdim] = st
@@ -1289,7 +1583,8 @@ class Engine:
                              text=seq.text_so_far, finished=True,
                              finish_reason=seq.finish_reason,
                              ttft_ms=(seq.first_token_time - seq.arrival) * 1e3 if seq.first_token_time else None,
-                             tpot_ms=sum(seq.itls) / len(seq.itls) * 1e3 if seq.itls else None)
+                             tpot_ms=sum(seq.itls) / len(seq.itls) * 1e3 if seq.itls else None,
+                             error=seq.error)
 
     def run_until_idle(self, on_token: Callable[[RequestOutput], None] | None = None) -> None:
         while not self.is_idle():
@@ -1302,5 +1597,12 @@ class Engine:
         return self.cache.used_blocks / self.cache.num_blocks
 
     def metrics(self) -> dict[str, float]:
-        return dict(self.stats, kv_usage=self.kv_usage(),
-                    running=len(self.running), waiting=len(self.waiting))
+        m = dict(self.stats, kv_usage=self.kv_usage(),
+                 running=len(self.running), waiting=len(self.waiting))
+        # speculation is only worth having if it accepts tokens: emit the ratio so an
+        # operator can see it working (or not) instead of inferring it from tok/s
+        steps = m.get("spec_steps", 0)
+        if steps:
+            m["spec_accept"] = round(m.get("spec_tokens", 0) / steps, 2)
+        m["spec_ema"] = round(self._accept_ema, 2)
+        return m

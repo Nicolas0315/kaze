@@ -23,6 +23,13 @@ ST_DTYPES = {"F16": torch.float16, "BF16": torch.bfloat16, "F32": torch.float32,
 
 def _read_safetensors_header(path: str) -> tuple[int, dict]:
     """(byte offset of the data section, {tensor name: header entry})."""
+    # Use the format's validator without materializing any tensors or faulting
+    # their pages; keep sequential reads for the actual weight data below.
+    try:
+        with safe_open(path, framework="pt", device="cpu"):
+            pass
+    except Exception as exc:
+        raise ValueError(f"invalid safetensors file {path}: {exc}") from exc
     with open(path, "rb") as f:
         n = struct.unpack("<Q", f.read(8))[0]
         hdr = json.loads(f.read(n))
@@ -38,15 +45,19 @@ def _shard_files(path: str) -> list[str]:
         if os.path.exists(idx):
             with open(idx, encoding="utf-8") as f:
                 shards = sorted(set(json.load(f)["weight_map"].values()))
+            root = os.path.realpath(path)
+            for shard in shards:
+                if (not isinstance(shard, str) or os.path.isabs(shard)
+                        or os.path.commonpath([root, os.path.realpath(os.path.join(root, shard))]) != root
+                        or not shard.endswith(pattern)):
+                    raise ValueError(f"invalid shard path: {shard!r}")
+            if not shards:
+                raise ValueError(f"empty shard index: {idx}")
             return [os.path.join(path, s) for s in shards]
-    files = sorted(f for f in os.listdir(path) if f.endswith(".safetensors"))
-    if files:
-        return [os.path.join(path, f) for f in files]
-    files = sorted(f for f in os.listdir(path)
-                   if f.endswith(".bin") and not f.endswith(".index.json"))
-    if not files:
-        raise FileNotFoundError(f"no safetensors or .bin weights in {path}")
-    return [os.path.join(path, f) for f in files]
+        files = sorted(f for f in os.listdir(path) if f.endswith(pattern))
+        if files:
+            return [os.path.join(path, f) for f in files]
+    raise FileNotFoundError(f"no safetensors or .bin weights in {path}")
 
 
 class _Reader:
@@ -65,14 +76,21 @@ class _Reader:
         self.bin: dict[str, dict] = {}
         self._keys: list[str] = []
         for f in self.files:
+            previous_keys = set(self._keys)
             if f.endswith(".safetensors"):
                 base, meta = _read_safetensors_header(f)
                 self.index[f] = (base, meta)
                 self._keys.extend(meta.keys())
             else:
                 d = torch.load(f, map_location="cpu", weights_only=True)
+                if not isinstance(d, dict) or any(not isinstance(k, str) or not isinstance(v, torch.Tensor)
+                                                 for k, v in d.items()):
+                    raise ValueError(f"{f}: expected a tensor weight mapping")
                 self.bin[f] = d
                 self._keys.extend(list(d.keys()))
+            duplicate = previous_keys.intersection(self._keys[len(previous_keys):])
+            if duplicate:
+                raise ValueError(f"duplicate tensor names across shards: {sorted(duplicate)}")
 
     def keys(self) -> list[str]:
         return self._keys
@@ -90,6 +108,8 @@ class _Reader:
             if len(buf) != b - a:
                 raise IOError(f"{name}: short read from {f} ({len(buf)} of {b - a} bytes); "
                               f"the file is truncated - re-download it")
+            if not buf:
+                return torch.empty(info["shape"], dtype=dtype)
             flat = torch.frombuffer(bytearray(buf), dtype=dtype)
             return flat.reshape(info["shape"])
         for f, d in self.bin.items():
@@ -111,32 +131,33 @@ def _q(t: torch.Tensor, bias: torch.Tensor | None, kind: str, group: int, device
                                   kind=kind, group=group)
 
 
-def _resolve_model_path(path: str) -> str:
-    """Accept a Hugging Face repo id as well as a local directory.
-
-    ("Qwen/Qwen2.5-0.5B-Instruct" is downloaded into the HF cache on first use.)
-    """
-    if os.path.isdir(path):
-        return path
-    if path.count("/") == 1 and not os.path.exists(path):
-        try:
-            from huggingface_hub import snapshot_download
-            return snapshot_download(repo_id=path)
-        except Exception:
-            return path
-    return path
-
-
 def load_model(path: str, kind: str = "int8", group: int = 128, device: str = "cuda",
                dtype: torch.dtype = torch.float16, lm_head_kind: str | None = None,
                verbose: bool = True) -> KazeModel:
-    path = _resolve_model_path(path)
+    # Only these quantisation group widths are verified on the GPU paths.  group 32 hits an
+    # illegal memory access in the int4 decode matvec (measured 2026-11-16), and anything
+    # outside {64, 128} would at best be untested: fail loudly instead of risking a
+    # corrupted CUDA context or silently wrong output.  64 is the quality option: KL
+    # 0.0126 -> 0.0064 on 0.5B for -3% decode (bench/kl_multi.py, docs/evidence.md).
+    if kind in ("int4", "int8") and group not in (64, 128) and device != "cpu":
+        raise ValueError(
+            f"group {group} is not supported for {kind} weights on the GPU: use 64 or 128 "
+            "(128 = fastest, 64 = half the KL for -3% decode). Other widths are untested "
+            "and group 32 crashes the int4 decode kernel with an illegal memory access.")
     cfg = ModelConfig.from_pretrained(path)
     dev = torch.device(device)
     reader = _Reader(path)
     keys = reader.keys()
     prefix = "model." if any(k.startswith("model.embed_tokens") for k in keys) else ""
-    embed_w = reader.get(prefix + "embed_tokens.weight")
+    def checked(name: str, shape: tuple[int, ...]) -> torch.Tensor:
+        tensor = reader.get(name)
+        if tuple(tensor.shape) != shape or not tensor.is_floating_point():
+            raise ValueError(f"{name}: expected floating weight shape {shape}, got {tuple(tensor.shape)} ({tensor.dtype})")
+        if not torch.isfinite(tensor).all().item():
+            raise ValueError(f"{name}: weight must be finite")
+        return tensor
+
+    embed_w = checked(prefix + "embed_tokens.weight", (cfg.vocab_size, cfg.hidden_size))
     embed = embed_w.to(dev, dtype).contiguous()
     del embed_w
     gc.collect()
@@ -145,8 +166,27 @@ def load_model(path: str, kind: str = "int8", group: int = 128, device: str = "c
     p = prefix
     for i in range(cfg.num_hidden_layers):
         b = f"{p}layers.{i}."
+        if any(k.startswith((b + "mlp.", b + "block_sparse_moe.")) and k.endswith(".bias") for k in keys):
+            raise ValueError(f"{b}mlp: bias weights are not supported")
         def g(name: str) -> torch.Tensor:
-            return reader.get(b + name)
+            shapes = {
+                "input_layernorm.weight": (cfg.hidden_size,),
+                "post_attention_layernorm.weight": (cfg.hidden_size,),
+                "self_attn.q_proj.weight": (cfg.q_size, cfg.hidden_size),
+                "self_attn.k_proj.weight": (cfg.kv_size, cfg.hidden_size),
+                "self_attn.v_proj.weight": (cfg.kv_size, cfg.hidden_size),
+                "self_attn.o_proj.weight": (cfg.hidden_size, cfg.q_size),
+                "self_attn.q_proj.bias": (cfg.q_size,),
+                "self_attn.k_proj.bias": (cfg.kv_size,),
+                "self_attn.v_proj.bias": (cfg.kv_size,),
+                "self_attn.o_proj.bias": (cfg.hidden_size,),
+                "self_attn.q_norm.weight": (cfg.head_dim,),
+                "self_attn.k_norm.weight": (cfg.head_dim,),
+                "mlp.gate_proj.weight": (cfg.intermediate_size, cfg.hidden_size),
+                "mlp.up_proj.weight": (cfg.intermediate_size, cfg.hidden_size),
+                "mlp.down_proj.weight": (cfg.hidden_size, cfg.intermediate_size),
+            }
+            return checked(b + name, shapes[name])
         an = g("input_layernorm.weight").to(dev, dtype)
         fn = g("post_attention_layernorm.weight").to(dev, dtype)
         wq = g("self_attn.q_proj.weight")
@@ -179,11 +219,13 @@ def load_model(path: str, kind: str = "int8", group: int = 128, device: str = "c
             del wd
         qn = g("self_attn.q_norm.weight").to(dev, dtype) if b + "self_attn.q_norm.weight" in keys else None
         kn = g("self_attn.k_norm.weight").to(dev, dtype) if b + "self_attn.k_norm.weight" in keys else None
+        if (qn is None) != (kn is None) or (cfg.qk_norm and qn is None):
+            raise ValueError(f"{b}self_attn: q_norm and k_norm weights must be present together")
         router = wgu_e = wdn_e = None
         moe_i = 0
         if b + "mlp.router.weight" in keys or b + "block_sparse_moe.gate.weight" in keys:
             rk = b + "mlp.router.weight" if b + "mlp.router.weight" in keys else b + "block_sparse_moe.gate.weight"
-            router = reader.get(rk).to(dev, dtype).contiguous()
+            router = checked(rk, (cfg.num_experts, cfg.hidden_size)).to(dev, dtype).contiguous()
             n_exp = router.shape[0]
             if b + "mlp.experts.gate_up_proj" in keys:          # fused per-expert tensors
                 wgu = reader.get(b + "mlp.experts.gate_up_proj")
@@ -197,26 +239,28 @@ def load_model(path: str, kind: str = "int8", group: int = 128, device: str = "c
                     pre = (b + f"mlp.experts.{e}." if b + f"mlp.experts.{e}.gate_proj.weight" in keys
                            else b + f"block_sparse_moe.experts.{e}.")
                     gu_parts.append(concat_rows([_q(reader.get(pre + "gate_proj.weight"), None, kind, group, dev, ffn=True),
-                                                 _q(reader.get(pre + "up_proj.weight"), None, kind, group, dev)]))
+                                                 _q(reader.get(pre + "up_proj.weight"), None, kind, group, dev, ffn=True)]))
                     dn_parts.append(_q(reader.get(pre + "down_proj.weight"), None, kind, group, dev, ffn=True))
                 moe_i = gu_parts[0].n // 2
-                wgu_e = _stack_quant(gu_parts)
-                wdn_e = _stack_quant(dn_parts)
+                wgu_e = concat_rows(gu_parts)
+                wdn_e = concat_rows(dn_parts)
                 del gu_parts, dn_parts
         layers.append(LayerWeights(an, wqkv, wo_q, fn, gu, wdown, qn, kn, router, wgu_e, wdn_e, moe_i))
         gc.collect()
-        torch.cuda.empty_cache()
+        if dev.type == "cuda":
+            torch.cuda.empty_cache()
         if verbose:
             print(f"  layer {i + 1}/{cfg.num_hidden_layers}", flush=True)
 
-    final_norm = reader.get(p + "norm.weight").to(dev, dtype)
+    final_norm = checked(p + "norm.weight", (cfg.hidden_size,)).to(dev, dtype)
     lm_kind = lm_head_kind or ("int8" if kind == "mixed" else kind)
-    if p + "lm_head.weight" in keys:
-        lm = _q(reader.get(p + "lm_head.weight"), None, lm_kind, group, dev)
+    head_key = next((k for k in (p + "lm_head.weight", "lm_head.weight") if k in keys), None)
+    if head_key is not None:
+        lm = _q(checked(head_key, (cfg.vocab_size, cfg.hidden_size)), None, lm_kind, group, dev)
+    elif cfg.tie_word_embeddings:
+        lm = QuantLinear.from_float(embed.float(), None, kind=lm_kind, group=group)
     else:
-        # from_float quantises row by row, so hand it the fp16 table directly:
-        # embed.float() used to materialise a full fp32 copy (+0.5 GB on a 152k vocab)
-        lm = QuantLinear.from_float(embed, None, kind=lm_kind, group=group)
+        raise KeyError("lm_head.weight is missing but tie_word_embeddings is False")
     model = KazeModel(cfg, embed, layers, final_norm, lm, dev, dtype=dtype)
     if verbose:
         print(f"  weights: {model.weight_bytes() / 1e6:.1f} MB", flush=True)

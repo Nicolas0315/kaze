@@ -7,7 +7,6 @@ Run: python3 tests/test_stress.py [trials]
 from __future__ import annotations
 
 import random
-import os
 import sys
 
 sys.path.insert(0, ".")
@@ -18,8 +17,7 @@ from transformers import AutoTokenizer
 from kaze.engine import DONE, Engine, SamplingParams
 from kaze.loader import load_model
 
-MODELS = os.environ.get("KAZE_MODELS", os.path.expanduser("~/models"))
-MODEL = os.path.join(MODELS, "Qwen2.5-0.5B-Instruct")
+MODEL = "/models/Qwen2.5-0.5B-Instruct"
 WORDS = "valley ledger engine kernel memory band width stream token model".split()
 
 

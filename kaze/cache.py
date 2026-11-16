@@ -69,7 +69,7 @@ class BlockAllocator:
 
     def register_hash(self, h: int, block: int) -> None:
         old = self.block_to_hash.get(block)
-        if old is not None and old != h:
+        if old is not None and old != h and self.hash_to_block.get(old) == block:
             self.hash_to_block.pop(old, None)
         self.hash_to_block[h] = block
         self.block_to_hash[block] = h

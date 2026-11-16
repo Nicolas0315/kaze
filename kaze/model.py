@@ -11,6 +11,7 @@ Two forward paths share the same weights and kernels:
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass
 
 import torch
@@ -22,6 +23,53 @@ from kaze.kernels import quant_linear as K_lin
 from kaze.kernels.act import silu_mul
 from kaze.kernels.fused import qk_norm_inplace, rope_scatter
 from kaze.quant import QuantLinear
+
+
+# Fold the split-K epilogue inside the consumer kernels (rmsnorm / rope_scatter) instead of
+# launching gemv_epilogue_kernel once per layer.  Only for the batch-1 bucket: at tdim>=16
+# the partials are 8x wider and the fuse was measured to be a wash.  KAZE_FUSE_EPILOGUE=0
+# or set_fuse_epilogue(False) restores the two-kernel path for A/B.
+FUSE_EPILOGUE = os.environ.get("KAZE_FUSE_EPILOGUE", "1") != "0"
+# Quantise prefill activations inside the rmsnorm that produces them, instead of a
+# separate quant_act launch per GEMM (96 launches per 512-token prefill, 7% of the step).
+FUSE_PREFILL_ACTQUANT = os.environ.get("KAZE_FUSE_PREFILL_ACTQUANT", "1") != "0"
+# Add the residual inside the int4 prefill GEMM epilogue instead of a separate torch add
+# (2 launches and 2 fp16 round trips of the hidden chunk per layer).
+FUSE_PREFILL_RESIDUAL = os.environ.get("KAZE_FUSE_PREFILL_RESIDUAL", "1") != "0"
+# Fold rope_scatter into the decode attention kernel for the single-pass (short) path:
+# one launch fewer per layer, and at batch >= 16 the step is latency bound so the launch
+# count matters more than the bandwidth the fused kernel re-reads.
+FUSE_ROPE_ATTN = os.environ.get("KAZE_FUSE_ROPE_ATTN", "1") != "0"
+# The gate_up kernel can write the down_proj's int8 activations itself (it already has
+# them in registers) when its column tile equals one quantisation group.
+_SWIGLU_BN = K_lin._SWIGLU_TILE[1]
+
+
+def set_fuse_epilogue(flag: bool) -> None:
+    """Switch the epilogue fold at runtime (benchmarks only; recapture graphs after)."""
+    global FUSE_EPILOGUE
+    FUSE_EPILOGUE = bool(flag)
+
+
+def set_fuse_prefill_actquant(flag: bool) -> None:
+    global FUSE_PREFILL_ACTQUANT
+    FUSE_PREFILL_ACTQUANT = bool(flag)
+
+
+def _splitk_of(lin, tdim: int, buf, fused: bool):
+    """(split_k, partial buffer) if this GEMV can hand its epilogue to the consumer."""
+    if not fused or lin is None:
+        return 1, None
+    # gemv() refuses split-K for fp16 weights (cfg_sk forced to 1) but the config table
+    # still reports depth 8 for them, so trusting the table here handed the consumer a
+    # partials buffer that gemv never writes: fp16 decode read zeros and diverged from
+    # prefill at cos 0.09.  Mirror gemv's guard exactly.
+    if lin.kind == "fp16":
+        return 1, None
+    depth = K_lin._cfg(lin.n, lin.k, lin.kind, rows=tdim)[1]
+    if depth <= 1 or buf.shape[0] < depth or buf.shape[2] != lin.n or buf.shape[1] != tdim:
+        return 1, None
+    return depth, buf[:depth]
 
 
 @dataclass
@@ -55,7 +103,13 @@ class KazeModel:
         self.cos, self.sin = make_rope_tables(cfg, device)
         self.buffers: dict[int, "DecodeBuffers"] = {}
         # block-sparse decode attention (0.0 = dense, the default)
-        self.num_splits = 8               # split-K factor for long-context decode
+        # Split-K factor for long-context decode.  The grid is (batch, KV heads, splits),
+        # so 8 leaves a 2-KV-head model at 16 CTAs on a 46-SM GPU (33% of the device) and
+        # long-context decode is bandwidth bound on exactly those CTAs: 48/kvh splits fill
+        # it for batch 1, and larger batches are already wide enough.  KAZE_ATTN_SPLITS
+        # overrides it for A/B measurements (same value must reach DecodeBuffers).
+        self.num_splits = int(os.environ.get(
+            "KAZE_ATTN_SPLITS", max(8, -(-48 // max(1, cfg.num_key_value_heads)))))
         self.batched_gemm = True          # use tensor-core GEMM at decode batch >= 16
         self.sparse_reuse = 8          # recompute the selection every N decode steps
         self._sel_cache: dict[int, tuple] = {}
@@ -86,7 +140,10 @@ class KazeModel:
         o2 = x2 * cos + x1 * sin
         return torch.cat((o1, o2), dim=-1).to(x.dtype)
 
-    def _mlp(self, hidden: torch.Tensor, layer: LayerWeights, xn: torch.Tensor) -> torch.Tensor:
+    def _mlp(self, hidden: torch.Tensor, layer: LayerWeights, xn: torch.Tensor,
+             aq: torch.Tensor | None = None, as_: torch.Tensor | None = None,
+             out_q: torch.Tensor | None = None,
+             out_s: torch.Tensor | None = None) -> torch.Tensor:
         cfg = self.cfg
         if layer.router is not None:
             out = hidden.clone()
@@ -94,8 +151,32 @@ class KazeModel:
             return out
         inter = cfg.intermediate_size
         if layer.wgate_up.kind in ("int8", "int4"):
-            act = K_lin.gemm_swiglu(xn, layer.wgate_up, inter)
-            down = K_lin.gemm(act, layer.wdown)
+            # the kernel only writes the int8 copy when its column tile equals one
+            # quantisation group; keep the flag in sync or the down GEMM reads garbage
+            # the fused int8 copy needs the w8a8 gate_up path (m >= 64) and a column tile
+            # that equals one quantisation group
+            fused_outq = (xn.shape[0] >= 64 and out_q is not None and out_s is not None
+                          and _SWIGLU_BN == (layer.wdown.group or 0))
+            if aq is not None and (layer.wgate_up.kind == "int4"
+                                   or (layer.wgate_up.kind == "int8" and K_lin.W8A8_PREFILL)):
+                act = K_lin.gemm_swiglu(xn, layer.wgate_up, inter, aq=aq, as_=as_,
+                                        out_q=out_q, out_s=out_s)
+            else:
+                act = K_lin.gemm_swiglu(xn, layer.wgate_up, inter)
+                fused_outq = False
+            # int8 activations on the silu product lose far too much accuracy (see
+            # W8A8_DOWN_PREFILL), so the down projection keeps fp16 activations unless
+            # the model is int4, where the weight error already dominates
+            fp16_acts = (layer.wdown.kind == "int8" and not K_lin.W8A8_DOWN_PREFILL)
+            if fused_outq:
+                # the swiglu kernel already produced the int8 activations for this GEMM
+                if FUSE_PREFILL_RESIDUAL and layer.wdown.kind == "int4":
+                    return K_lin.gemm(act, layer.wdown, add_to=hidden,
+                                      aq=out_q, as_=out_s)
+                return hidden + K_lin.gemm(act, layer.wdown, aq=out_q, as_=out_s)
+            if FUSE_PREFILL_RESIDUAL and layer.wdown.kind == "int4" and act.shape[0] >= 64:
+                return K_lin.gemm(act, layer.wdown, add_to=hidden, fp16_acts=fp16_acts)
+            down = K_lin.gemm(act, layer.wdown, fp16_acts=fp16_acts)
         else:
             gu = K_lin.gemm(xn, layer.wgate_up)
             act = silu_mul(gu[:, :inter], gu[:, inter:], stride_g=2 * inter)
@@ -121,7 +202,8 @@ class KazeModel:
             flat = idx_flat
         else:
             logits = torch.nn.functional.linear(xn2.float(), layer.router.float())
-            w, idx = torch.topk(logits, k, dim=-1)
+            probs = torch.softmax(logits, dim=-1)
+            w, idx = torch.topk(probs, k, dim=-1)
             if cfg.norm_topk_prob:
                 w = w / w.sum(-1, keepdim=True)
             flat = idx.reshape(-1).to(torch.int32)
@@ -140,7 +222,8 @@ class KazeModel:
         k = cfg.num_experts_per_tok
         p = xn2.shape[0]
         logits = torch.nn.functional.linear(xn2.float(), layer.router.float())
-        w, idx = torch.topk(logits, k, dim=-1)
+        probs = torch.softmax(logits, dim=-1)
+        w, idx = torch.topk(probs, k, dim=-1)
         if cfg.norm_topk_prob:
             w = w / w.sum(-1, keepdim=True)
         i, h = layer.moe_i, cfg.hidden_size
@@ -219,11 +302,36 @@ class KazeModel:
         q_buf = torch.empty((p, hq, d), dtype=torch.float16, device=hidden.device)
         qs_t = torch.tensor([q_start], dtype=torch.int32, device=hidden.device)
         sl_t = torch.tensor([seq_len], dtype=torch.int32, device=hidden.device)
+        # The int4 prefill GEMMs quantise their activations first; doing that inside the
+        # rmsnorm that produces them removes one launch and one full read of xn per GEMM
+        # (96 launches in a 512-token prefill, measured at 8% of the step).
+        act_q = None
+        act_q2 = None
+        # only allocate the int8 activation copy when a GEMM will actually consume it
+        # (int4 always; int8 only when the W8A8 prefill path is enabled, which is off by
+        # default because of the accuracy loss measured in kernels/quant_linear.py)
+        uses_aq = any(l.wqkv.kind == "int4"
+                      or (l.wqkv.kind == "int8" and K_lin.W8A8_PREFILL)
+                      for l in self.layers)
+        if FUSE_PREFILL_ACTQUANT and uses_aq:
+            act_q = torch.empty((p, cfg.hidden_size), dtype=torch.int8, device=hidden.device)
+            act_s = torch.empty((p, (cfg.hidden_size + 127) // 128), dtype=torch.float32,
+                                device=hidden.device)
+            inter = cfg.intermediate_size
+            if inter % 128 == 0:
+                act_q2 = torch.empty((p, inter), dtype=torch.int8, device=hidden.device)
+                act_s2 = torch.empty((p, inter // 128), dtype=torch.float32, device=hidden.device)
         for li, layer in enumerate(self.layers):
             k_flat = k_flat_all[li]
             v_flat = v_flat_all[li]
-            xn = K_norm.rmsnorm(hidden, layer.attn_norm, cfg.rms_norm_eps)
-            qkv = K_lin.gemm(xn, layer.wqkv)                     # [P, qs+2kvs]
+            if act_q is not None and layer.wqkv.group == 128 and (layer.wqkv.kind == "int4"
+                                      or (layer.wqkv.kind == "int8" and K_lin.W8A8_PREFILL)):
+                xn = K_norm.rmsnorm(hidden, layer.attn_norm, cfg.rms_norm_eps,
+                                    out_q=act_q, out_s=act_s)
+                qkv = K_lin.gemm(xn, layer.wqkv, aq=act_q, as_=act_s)   # [P, qs+2kvs]
+            else:
+                xn = K_norm.rmsnorm(hidden, layer.attn_norm, cfg.rms_norm_eps)
+                qkv = K_lin.gemm(xn, layer.wqkv)
             self._rope(cache, li, qkv, q_buf, k_flat, v_flat,
                          new_slots, positions, hq, hkv, d, p,
                          q_norm=layer.q_norm, k_norm=layer.k_norm, eps=cfg.rms_norm_eps)
@@ -232,10 +340,20 @@ class KazeModel:
             attn = self._prefill_attn(cache, li, q_buf, cache.k[li], cache.v[li], block_table,
                                              qs_t, sl_t, cache.block_size,
                                              hq // hkv, d, self.scale)
-            o = K_lin.gemm(attn.view(p, qs), layer.wo)
-            hidden = hidden + o
-            xn2 = K_norm.rmsnorm(hidden, layer.ffn_norm, cfg.rms_norm_eps)
-            hidden = self._mlp(hidden, layer, xn2)
+            if (FUSE_PREFILL_RESIDUAL and layer.wo.kind == "int4" and p >= 64):
+                K_lin.gemm(attn.view(p, qs), layer.wo, add_to=hidden)
+            else:
+                hidden = hidden + K_lin.gemm(attn.view(p, qs), layer.wo)
+            if (act_q is not None and layer.wgate_up is not None
+                    and layer.wgate_up.group == 128
+                    and layer.wgate_up.kind in ("int4", "int8")):
+                xn2 = K_norm.rmsnorm(hidden, layer.ffn_norm, cfg.rms_norm_eps,
+                                     out_q=act_q, out_s=act_s)
+                hidden = self._mlp(hidden, layer, xn2, aq=act_q, as_=act_s,
+                                   out_q=act_q2, out_s=act_s2 if act_q2 is not None else None)
+            else:
+                xn2 = K_norm.rmsnorm(hidden, layer.ffn_norm, cfg.rms_norm_eps)
+                hidden = self._mlp(hidden, layer, xn2)
 
         xn = K_norm.rmsnorm(hidden, self.final_norm, cfg.rms_norm_eps)
         if last_only:
@@ -243,6 +361,65 @@ class KazeModel:
             pad[0].copy_(xn[-1])
             return K_lin.gemv(pad, self.lm_head, 16)[:1]
         return K_lin.gemm(xn, self.lm_head)
+
+    def prefill_batched(self, ids: torch.Tensor, positions: torch.Tensor,
+                        slots: torch.Tensor, cache, block_tables: torch.Tensor,
+                        lens: torch.Tensor, seq_of_group: torch.Tensor,
+                        last_rows: torch.Tensor) -> torch.Tensor:
+        """One forward for prefill chunks of several sequences.
+
+        ids / positions / slots are [M] with the chunks concatenated along the row axis;
+        row i belongs to sequence seq_of_group[i // 16] (groups never straddle a
+        sequence) and lens[g] is that sequence total key count.  Returns [B, vocab] with
+        the logits of last_rows[b] (the last row of sequence b).
+        """
+        cfg = self.cfg
+        dev = self.device
+        hidden = self.embed.index_select(0, ids)
+        hq, hkv, d = cfg.num_attention_heads, cfg.num_key_value_heads, self.head_dim
+        qs = hq * d
+        p = ids.shape[0]
+        q_buf = torch.empty((p, hq, d), dtype=torch.float16, device=dev)
+        attn_buf = torch.empty((p, hq, d), dtype=torch.float16, device=dev)
+        uses_aq = any(l.wqkv.kind == "int4" for l in self.layers)
+        act_q = act_s = act_q2 = act_s2 = None
+        if FUSE_PREFILL_ACTQUANT and uses_aq:
+            act_q = torch.empty((p, cfg.hidden_size), dtype=torch.int8, device=dev)
+            act_s = torch.empty((p, (cfg.hidden_size + 127) // 128),
+                                dtype=torch.float32, device=dev)
+            inter = cfg.intermediate_size
+            if inter % 128 == 0:
+                act_q2 = torch.empty((p, inter), dtype=torch.int8, device=dev)
+                act_s2 = torch.empty((p, inter // 128), dtype=torch.float32, device=dev)
+        for li, layer in enumerate(self.layers):
+            if act_q is not None and layer.wqkv.kind == "int4":
+                xn = K_norm.rmsnorm(hidden, layer.attn_norm, cfg.rms_norm_eps,
+                                    out_q=act_q, out_s=act_s)
+                qkv = K_lin.gemm(xn, layer.wqkv, aq=act_q, as_=act_s)
+            else:
+                xn = K_norm.rmsnorm(hidden, layer.attn_norm, cfg.rms_norm_eps)
+                qkv = K_lin.gemm(xn, layer.wqkv)
+            self._rope(cache, li, qkv, q_buf, cache.k_flat[li], cache.v_flat[li],
+                       slots, positions, hq, hkv, d, p,
+                       q_norm=layer.q_norm, k_norm=layer.k_norm, eps=cfg.rms_norm_eps)
+            K_attn.attn_prefill_batch(q_buf, cache.k[li], cache.v[li], block_tables,
+                                      positions, lens, seq_of_group, p,
+                                      cache.block_size, hq // hkv, d, self.scale,
+                                      out=attn_buf)
+            if FUSE_PREFILL_RESIDUAL and layer.wo.kind == "int4" and p >= 64:
+                K_lin.gemm(attn_buf.view(p, qs), layer.wo, add_to=hidden)
+            else:
+                hidden = hidden + K_lin.gemm(attn_buf.view(p, qs), layer.wo)
+            if act_q is not None and layer.wgate_up is not None:
+                xn2 = K_norm.rmsnorm(hidden, layer.ffn_norm, cfg.rms_norm_eps,
+                                     out_q=act_q, out_s=act_s)
+                hidden = self._mlp(hidden, layer, xn2, aq=act_q, as_=act_s,
+                                   out_q=act_q2, out_s=act_s2)
+            else:
+                xn2 = K_norm.rmsnorm(hidden, layer.ffn_norm, cfg.rms_norm_eps)
+                hidden = self._mlp(hidden, layer, xn2)
+        xn = K_norm.rmsnorm(hidden, self.final_norm, cfg.rms_norm_eps)
+        return K_lin.gemm(xn.index_select(0, last_rows), self.lm_head)
 
     # ---------------------------------------------------------------- decode
     def decode_logits(self, ids: torch.Tensor, positions: torch.Tensor,
@@ -270,18 +447,44 @@ class KazeModel:
         bufs.active[:b].copy_(self.embed.index_select(0, ids))
         hidden[:b].copy_(bufs.active[:b])
 
+        # Fold the split-K epilogue in the consumer (one launch per layer less).  pending
+        # carries the down_proj partials into the next layer's attn_norm.
+        # Fold at every tdim: at batch >= 16 the step is *latency* bound (same graph:
+        # 3.7 ms with a sync per step vs 1.9 ms pipelined), so removing the 48 epilogue
+        # launches is worth more than the wider partial reads it costs.  The cos-0.18
+        # regression that once pushed this back to tdim == 1 was not the fold at all: it
+        # was the fp16 partials mismatch fixed in _splitk_of (round 128).
+        fused = FUSE_EPILOGUE
+        pending = None
         for li, layer in enumerate(self.layers):
             k_flat = k_flat_all[li]
             v_flat = v_flat_all[li]
             q8 = K_lin.W4A8_DECODE and layer.wqkv.kind == "int4"
+            part, depth, pb = pending if pending is not None else (None, 1, None)
             xn = K_norm.rmsnorm(hidden, layer.attn_norm, cfg.rms_norm_eps, out=bufs.xn,
                                 out_q=bufs.xn_q if q8 else None,
-                                out_s=bufs.xn_s if q8 else None)
-            qkv = K_lin.gemv(xn, layer.wqkv, tdim, out=bufs.qkv,
-                             xq=bufs.xn_q if q8 else None, xs=bufs.xn_s if q8 else None)
-            self._rope(cache, li, qkv, bufs.q, k_flat, v_flat, slots, positions,
-                         hq, hkv, d, b,
-                         q_norm=layer.q_norm, k_norm=layer.k_norm, eps=cfg.rms_norm_eps)
+                                out_s=bufs.xn_s if q8 else None,
+                                partials=part, bias=pb, res=hidden if part is not None else None)
+            pending = None
+            sk, qkv_part = _splitk_of(layer.wqkv, tdim, bufs.sk_qkv, fused)
+            K_lin.gemv(xn, layer.wqkv, tdim, out=bufs.qkv,
+                       xq=bufs.xn_q if q8 else None, xs=bufs.xn_s if q8 else None,
+                       acc=qkv_part, defer_epilogue=qkv_part is not None)
+            # bufs.qkv stays the shape carrier for rope_scatter; when the epilogue is
+            # deferred the projection is read from the partials instead of this buffer.
+            # tdim == 1 only, measured (bench/rope_fusion_ab32.py): the fused kernel wins
+            # at batch 1 (+2.5%, one launch less per layer) but loses ~2.7% at batch 32 --
+            # the fold + attention loop in one kernel costs registers, and 128 fat CTAs
+            # hide latency worse than 32 light + 128 light ones.
+            fuse_rope = (FUSE_ROPE_ATTN and qkv_part is not None
+                         and attn_mode == "short" and not getattr(cache, "q8", False)
+                         and layer.q_norm is None and layer.k_norm is None
+                         and self.sparse_frac <= 0 and self.sparse_frac_deep <= 0)
+            if not fuse_rope:
+                self._rope(cache, li, bufs.qkv, bufs.q, k_flat, v_flat, slots, positions,
+                           hq, hkv, d, b,
+                           q_norm=layer.q_norm, k_norm=layer.k_norm, eps=cfg.rms_norm_eps,
+                           partials=qkv_part, bias=layer.wqkv.bias)
             n_layer = len(self.layers)
             frac = self.sparse_frac + (self.sparse_frac_deep - self.sparse_frac) * (li / max(1, n_layer - 1))
             sparse = frac > 0 and int(seq_lens[:b].max()) > self.sparse_min_len
@@ -302,6 +505,12 @@ class KazeModel:
                     bufs.block_size, hq // hkv, d, self.scale,
                     acc_buf=bufs.acc[:b], ml_buf=bufs.ml[:b],
                     out=bufs.attn[:b].view(b, hq, d), num_splits=bufs.acc.shape[2])
+            elif fuse_rope:
+                K_attn.rope_attn_decode(qkv_part, layer.wqkv.bias, self.cos, self.sin,
+                                        cache.k[li], cache.v[li], block_tables,
+                                        slots, positions, seq_lens, hq, hkv, d,
+                                        self.scale, bufs.attn[:b].view(b, hq, d),
+                                        bufs.block_size)
             else:
                 ks_l, vs_l = cache.scales(li)
                 K_attn.attn_decode(bufs.q[:b], cache.k[li], cache.v[li], block_tables,
@@ -310,20 +519,37 @@ class KazeModel:
                                    acc_buf=bufs.acc[:b], ml_buf=bufs.ml[:b],
                                    scale=self.scale, mode=attn_mode,
                                    k_scale=ks_l, v_scale=vs_l)
-            K_lin.gemv(bufs.attn, layer.wo, tdim, out=bufs.o, add_to=hidden)
-            q8m = K_lin.W8A8_SWIGLU_DECODE and layer.wgate_up.kind == "int4"
+            sko, o_part = _splitk_of(layer.wo, tdim, bufs.sk_h, fused)
+            K_lin.gemv(bufs.attn, layer.wo, tdim, out=bufs.o,
+                       add_to=None if o_part is not None else hidden,
+                       acc=o_part, defer_epilogue=o_part is not None)
+            # tdim >= 16 only: the tensor-core path is 252 -> 208 us at TDIM=32 but
+            # 13.6 -> 16.9 us at TDIM=1 (bench/swiglu_tdim1_ab.py), so batch-1
+            # decode keeps the fp16-activation unpack kernel.
+            q8m = (K_lin.W8A8_SWIGLU_DECODE and tdim >= 16
+                   and layer.wgate_up is not None
+                   and layer.wgate_up.kind == "int4")
             xn2 = K_norm.rmsnorm(hidden, layer.ffn_norm, cfg.rms_norm_eps, out=bufs.xn,
                                  out_q=bufs.xn_q if q8m else None,
-                                 out_s=bufs.xn_s if q8m else None)
+                                 out_s=bufs.xn_s if q8m else None,
+                                 partials=o_part, bias=layer.wo.bias,
+                                 res=hidden if o_part is not None else None)
             if layer.router is not None:
                 self._moe_decode(layer, xn2, hidden, cfg, bufs)
             else:
                 act = K_lin.gemv_swiglu(xn2, layer.wgate_up, tdim, inter, out=bufs.act,
                                         xq=bufs.xn_q if q8m else None,
                                         xs=bufs.xn_s if q8m else None)
-                K_lin.gemv(act, layer.wdown, tdim, out=bufs.o, add_to=hidden)
+                skd, d_part = _splitk_of(layer.wdown, tdim, bufs.sk_h, fused)
+                K_lin.gemv(act, layer.wdown, tdim, out=bufs.o,
+                           add_to=None if d_part is not None else hidden,
+                           acc=d_part, defer_epilogue=d_part is not None)
+                if d_part is not None:
+                    pending = (d_part, skd, layer.wdown.bias)
 
-        xn = K_norm.rmsnorm(hidden, self.final_norm, cfg.rms_norm_eps, out=bufs.xn)
+        part, depth, pb = pending if pending is not None else (None, 1, None)
+        xn = K_norm.rmsnorm(hidden, self.final_norm, cfg.rms_norm_eps, out=bufs.xn,
+                            partials=part, bias=pb, res=hidden if part is not None else None)
         logits = K_lin.gemv(xn, self.lm_head, tdim, out=bufs.logits)
         return logits[:b]
 
@@ -369,7 +595,12 @@ class KazeModel:
                     q_start, seq_len, cache.block_size, hq // hkv, d, self.scale)
                 bufs.attn[lo:hi].copy_(attn.view(hi - lo, qs))
             K_lin.gemv(bufs.attn, layer.wo, tdim, out=bufs.o, add_to=hidden)
-            q8m = K_lin.W8A8_SWIGLU_DECODE and layer.wgate_up.kind == "int4"
+            # tdim >= 16 only: the tensor-core path is 252 -> 208 us at TDIM=32 but
+            # 13.6 -> 16.9 us at TDIM=1 (bench/swiglu_tdim1_ab.py), so batch-1
+            # decode keeps the fp16-activation unpack kernel.
+            q8m = (K_lin.W8A8_SWIGLU_DECODE and tdim >= 16
+                   and layer.wgate_up is not None
+                   and layer.wgate_up.kind == "int4")
             xn2 = K_norm.rmsnorm(hidden, layer.ffn_norm, cfg.rms_norm_eps, out=bufs.xn,
                                  out_q=bufs.xn_q if q8m else None,
                                  out_s=bufs.xn_s if q8m else None)
@@ -418,7 +649,12 @@ class KazeModel:
                                              hq // hkv, d, self.scale)
             bufs.attn[:n].copy_(attn.view(n, qs))
             K_lin.gemv(bufs.attn, layer.wo, tdim, out=bufs.o, add_to=hidden)
-            q8m = K_lin.W8A8_SWIGLU_DECODE and layer.wgate_up.kind == "int4"
+            # tdim >= 16 only: the tensor-core path is 252 -> 208 us at TDIM=32 but
+            # 13.6 -> 16.9 us at TDIM=1 (bench/swiglu_tdim1_ab.py), so batch-1
+            # decode keeps the fp16-activation unpack kernel.
+            q8m = (K_lin.W8A8_SWIGLU_DECODE and tdim >= 16
+                   and layer.wgate_up is not None
+                   and layer.wgate_up.kind == "int4")
             xn2 = K_norm.rmsnorm(hidden, layer.ffn_norm, cfg.rms_norm_eps, out=bufs.xn,
                                  out_q=bufs.xn_q if q8m else None,
                                  out_s=bufs.xn_s if q8m else None)
@@ -431,7 +667,6 @@ class KazeModel:
                 K_lin.gemv(act, layer.wdown, tdim, out=bufs.o, add_to=hidden)
         xn = K_norm.rmsnorm(hidden, self.final_norm, cfg.rms_norm_eps, out=bufs.xn)
         return K_lin.gemv(xn, self.lm_head, tdim, out=bufs.logits)
-        return logits[:n]
 
     def get_buffers(self, tdim: int) -> "DecodeBuffers":
         b = self.buffers.get(tdim)
@@ -452,10 +687,15 @@ class KazeModel:
         ks, vs = self._kv_scales(cache, layer)
         return K_attn.attn_prefill_paged(*args, k_scale=ks, v_scale=vs, **kwargs)
 
-    def _rope(self, cache, layer, qkv, out_q, k_flat, v_flat, slots, positions, *args, **kw):
+    def _rope(self, cache, layer, qkv, out_q, k_flat, v_flat, slots, positions, *args,
+              partials=None, bias=None, **kw):
         ks, vs = self._kv_scales(cache, layer)
+        # a caller (prefill_hidden) may pass the scales itself; ours wins, so drop theirs
+        kw.pop("k_scale", None)
+        kw.pop("v_scale", None)
         return rope_scatter(qkv, self.cos, self.sin, out_q, k_flat, v_flat, slots, positions,
-                            *args, **kw, k_scale=ks, v_scale=vs)
+                            *args, **kw, k_scale=ks, v_scale=vs,
+                            partials=partials, bias=bias)
 
     def weight_bytes(self) -> int:
         n = self.embed.numel() * self.embed.element_size()
@@ -502,10 +742,20 @@ class DecodeBuffers:
                                    device=device)
         self.moe_w = torch.zeros((tdim * max(cfg.num_experts_per_tok, 1),), dtype=torch.float32,
                                  device=device)
-        self.acc = torch.zeros((tdim, kvh, num_splits, 16, d), dtype=torch.float32,
+        gqa = hq // hkv
+        group_heads = max(16, 1 << (gqa - 1).bit_length())
+        self.acc = torch.zeros((tdim, kvh, num_splits, group_heads, d), dtype=torch.float32,
                                device=device)
-        self.ml = torch.zeros((tdim, kvh, num_splits, 2, 16), dtype=torch.float32,
+        self.ml = torch.zeros((tdim, kvh, num_splits, 2, group_heads), dtype=torch.float32,
                               device=device)
+        # split-K partials that the consumers (rime norm / rope) fold themselves instead of
+        # a separate epilogue kernel.  Depth 8 is the largest split the config table asks
+        # for; qkv has its own width, o_proj and down_proj share the hidden-width one
+        # (down_proj writes it, the next layer's attn_norm reads it, then o_proj overwrites).
+        self.sk_depth = 8
+        self.sk_qkv = torch.zeros((self.sk_depth, tdim, qs + 2 * kvs), dtype=torch.float32,
+                                  device=device)
+        self.sk_h = torch.zeros((self.sk_depth, tdim, h), dtype=torch.float32, device=device)
 
 
 class DenseReference:

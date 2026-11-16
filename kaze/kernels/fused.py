@@ -15,12 +15,31 @@ import triton.language as tl
 
 
 @triton.jit
+def _fold_row(PART, BIAS, m, col, N, BLOCK: tl.constexpr, SPLIT_K: tl.constexpr,
+              HAS_BIAS: tl.constexpr, TDIM: tl.constexpr):
+    """Fold split-K partials (+bias) for one head's half-dim range, as fp16 values.
+
+    Same order as gemv_epilogue_kernel (sp ascending, then bias, then one fp16 rounding),
+    so the rope/KV output is bit identical to the two-kernel path.
+    """
+    offs = tl.arange(0, BLOCK)
+    y = tl.zeros((BLOCK,), dtype=tl.float32)
+    for sp in tl.static_range(SPLIT_K):
+        y += tl.load(PART + sp * (TDIM * N) + m * N + col + offs)
+    if HAS_BIAS:
+        y += tl.load(BIAS + col + offs)
+    return y.to(tl.float16).to(tl.float32)
+
+
+@triton.jit
 def rope_scatter_kernel(QKV, COS, SIN, OUTQ, KFLAT, VFLAT, KS, VS, SLOTS, POS,
-                        NQ, NKV, D, QS, KVS, QN, KN, EPS,
+                        NQ, NKV, D, QS, KVS, QN, KN, EPS, PART, BIAS,
                         HALF: tl.constexpr, BM: tl.constexpr, NH,
                         HAS_NORM: tl.constexpr = False, Q8K: tl.constexpr = False,
                         Q8V: tl.constexpr = False,
-                        NS: tl.constexpr = 1, LANE: tl.constexpr = 32):
+                        NS: tl.constexpr = 1, LANE: tl.constexpr = 32,
+                        HAS_SPLITK: tl.constexpr = False, SPLIT_K: tl.constexpr = 1,
+                        HAS_BIAS: tl.constexpr = False, TDIM: tl.constexpr = 1):
     h = tl.program_id(0)
     m = tl.program_id(1)
     offs = tl.arange(0, HALF)
@@ -30,9 +49,14 @@ def rope_scatter_kernel(QKV, COS, SIN, OUTQ, KFLAT, VFLAT, KS, VS, SLOTS, POS,
     c = tl.load(COS + pos.to(tl.int64) * HALF + offs)
     s = tl.load(SIN + pos.to(tl.int64) * HALF + offs)
     if h < NQ:
-        p = base + h * D
-        x1 = tl.load(p + offs).to(tl.float32)
-        x2 = tl.load(p + HALF + offs).to(tl.float32)
+        if HAS_SPLITK:
+            x1 = _fold_row(PART, BIAS, m, h * D, stride_row, HALF, SPLIT_K, HAS_BIAS, TDIM)
+            x2 = _fold_row(PART, BIAS, m, h * D + HALF, stride_row, HALF, SPLIT_K,
+                           HAS_BIAS, TDIM)
+        else:
+            p = base + h * D
+            x1 = tl.load(p + offs).to(tl.float32)
+            x2 = tl.load(p + HALF + offs).to(tl.float32)
         if HAS_NORM:
             var = (tl.sum(x1 * x1 + x2 * x2, axis=0)) / D
             r = tl.rsqrt(var + EPS)
@@ -45,9 +69,15 @@ def rope_scatter_kernel(QKV, COS, SIN, OUTQ, KFLAT, VFLAT, KS, VS, SLOTS, POS,
         j = h - NQ
         slot = tl.load(SLOTS + m)
         if j < NKV:
-            p = base + QS + j * D
-            x1 = tl.load(p + offs).to(tl.float32)
-            x2 = tl.load(p + HALF + offs).to(tl.float32)
+            if HAS_SPLITK:
+                x1 = _fold_row(PART, BIAS, m, QS + j * D, stride_row, HALF, SPLIT_K,
+                               HAS_BIAS, TDIM)
+                x2 = _fold_row(PART, BIAS, m, QS + j * D + HALF, stride_row, HALF, SPLIT_K,
+                               HAS_BIAS, TDIM)
+            else:
+                p = base + QS + j * D
+                x1 = tl.load(p + offs).to(tl.float32)
+                x2 = tl.load(p + HALF + offs).to(tl.float32)
             if HAS_NORM:
                 var = (tl.sum(x1 * x1 + x2 * x2, axis=0)) / D
                 r = tl.rsqrt(var + EPS)
@@ -68,7 +98,7 @@ def rope_scatter_kernel(QKV, COS, SIN, OUTQ, KFLAT, VFLAT, KS, VS, SLOTS, POS,
                 s1 = tl.zeros((HALF,), dtype=tl.float32)
                 s2 = tl.zeros((HALF,), dtype=tl.float32)
                 for ci in tl.static_range(CH):
-                    sc_lo: tl.constexpr = ci * LANE
+                    sc_lo = ci * LANE
                     sel = (offs >= sc_lo) & (offs < sc_lo + LANE)
                     a1 = tl.maximum(tl.max(tl.abs(tl.where(sel, k1, 0.0)), axis=0), 1e-8) / 127.0
                     a2 = tl.maximum(tl.max(tl.abs(tl.where(sel, k2, 0.0)), axis=0), 1e-8) / 127.0
@@ -88,9 +118,15 @@ def rope_scatter_kernel(QKV, COS, SIN, OUTQ, KFLAT, VFLAT, KS, VS, SLOTS, POS,
                 tl.store(dstk + HALF + offs, k2.to(dstk.dtype.element_ty), mask=mask)
         else:
             jv = j - NKV
-            p = base + QS + KVS + jv * D
-            v = tl.load(p + offs)
-            v2 = tl.load(p + HALF + offs)
+            if HAS_SPLITK:
+                v = _fold_row(PART, BIAS, m, QS + KVS + jv * D, stride_row, HALF, SPLIT_K,
+                              HAS_BIAS, TDIM).to(tl.float16)
+                v2 = _fold_row(PART, BIAS, m, QS + KVS + jv * D + HALF, stride_row, HALF,
+                               SPLIT_K, HAS_BIAS, TDIM).to(tl.float16)
+            else:
+                p = base + QS + KVS + jv * D
+                v = tl.load(p + offs)
+                v2 = tl.load(p + HALF + offs)
             dstv = VFLAT + slot.to(tl.int64) * KVS + jv * D
             mask = m < NH
             if Q8V:
@@ -99,14 +135,14 @@ def rope_scatter_kernel(QKV, COS, SIN, OUTQ, KFLAT, VFLAT, KS, VS, SLOTS, POS,
                 t1 = tl.zeros((HALF,), dtype=tl.float32)
                 t2 = tl.zeros((HALF,), dtype=tl.float32)
                 for cj in tl.static_range(CH2):
-                    lo2: tl.constexpr = c * LANE
+                    lo2 = cj * LANE
                     sel2 = (offs >= lo2) & (offs < lo2 + LANE)
                     a1 = tl.maximum(tl.max(tl.abs(tl.where(sel2, v, 0.0)), axis=0), 1e-8) / 127.0
                     a2 = tl.maximum(tl.max(tl.abs(tl.where(sel2, v2, 0.0)), axis=0), 1e-8) / 127.0
                     t1 = tl.where(sel2, a1, t1)
                     t2 = tl.where(sel2, a2, t2)
-                    tl.store(base_s + c, a1)
-                    tl.store(base_s + CH2 + c, a2)
+                    tl.store(base_s + cj, a1)
+                    tl.store(base_s + CH2 + cj, a2)
                 qv = v / t1
                 qv2 = v2 / t2
                 tl.store(dstv + offs, (qv + tl.where(qv >= 0, 0.5, -0.5)).to(tl.int8),
@@ -125,11 +161,19 @@ def rope_scatter(qkv: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
                  q_norm: torch.Tensor | None = None, k_norm: torch.Tensor | None = None,
                  eps: float = 1e-6,
                  k_scale: torch.Tensor | None = None,
-                 v_scale: torch.Tensor | None = None) -> None:
-    """RoPE + KV scatter, optionally with Qwen3-style per-head RMSNorm fused in."""
+                 v_scale: torch.Tensor | None = None,
+                 partials: torch.Tensor | None = None,
+                 bias: torch.Tensor | None = None) -> None:
+    """RoPE + KV scatter, optionally with Qwen3-style per-head RMSNorm fused in.
+
+    Passing partials (a split-K GEMV output of shape [SPLIT_K, TDIM, qs+2*kvs] fp32) makes
+    the kernel fold the epilogue itself: this replaces the separate epilogue launch and
+    reads the qkv projection exactly once (bit identical to the two-kernel path).
+    """
     tdim = qkv.shape[0]
     grid = (n_q_heads + 2 * n_kv_heads, tdim)
     has_norm = q_norm is not None
+    has_sk = partials is not None
     qn = q_norm if has_norm else qkv
     kn = k_norm if k_norm is not None else qn
     q8k = k_flat.dtype == torch.int8
@@ -141,8 +185,12 @@ def rope_scatter(qkv: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
         qkv, cos, sin, out_q, k_flat, v_flat, ks, vs, slots, positions,
         n_q_heads, n_kv_heads, head_dim, n_q_heads * head_dim, n_kv_heads * head_dim,
         qn, kn, eps,
+        partials if has_sk else qkv, bias if bias is not None else qkv,
         HALF=head_dim // 2, BM=tdim, NH=num_real, HAS_NORM=has_norm,
-        Q8K=q8k, Q8V=q8v, NS=ns_scale, LANE=32, num_warps=1)
+        Q8K=q8k, Q8V=q8v, NS=ns_scale, LANE=32,
+        HAS_SPLITK=has_sk, SPLIT_K=partials.shape[0] if has_sk else 1,
+        HAS_BIAS=bias is not None, TDIM=partials.shape[1] if has_sk else tdim,
+        num_warps=2 if has_sk else 1)
 
 
 @triton.jit

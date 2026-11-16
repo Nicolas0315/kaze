@@ -12,9 +12,57 @@ so a GEMM tile needs exactly one scale per row.
 """
 from __future__ import annotations
 
+from typing import Iterator
+
 import torch
 
 NIBBLE_SHIFTS = tuple(4 * j for j in range(8))
+
+
+def _validation_chunks(weight: torch.Tensor) -> Iterator[torch.Tensor]:
+    # Keep validation temporaries bounded even for vocab-wide heads. Slicing
+    # also handles noncontiguous matrices without copying the full weight.
+    limit = 1024 * 1024
+    width = min(weight.shape[1], limit)
+    rows = max(1, limit // width)
+    for start in range(0, weight.shape[0], rows):
+        for column in range(0, weight.shape[1], width):
+            yield weight[start:start + rows, column:column + width]
+
+
+def _validate_weight(weight: torch.Tensor, group: int, *, int4: bool = False) -> None:
+    if type(group) is not int or group <= 0 or (int4 and group % 8):
+        raise ValueError("group must be positive (and a multiple of 8 for int4)")
+    if weight.ndim != 2 or any(d <= 0 for d in weight.shape):
+        raise ValueError("weight must be a nonempty [N, K] matrix")
+    if not weight.is_floating_point():
+        raise ValueError("weight must contain finite floating point values")
+    for part in _validation_chunks(weight):
+        if not torch.isfinite(part).all().item():
+            raise ValueError("weight must contain finite floating point values")
+
+
+def _stored_scale(absmax: torch.Tensor, divisor: float) -> torch.Tensor:
+    # Quantize against the actual fp16 scale consumed by the kernels, including
+    # subnormal scales; a float32-only minimum rounds to zero when stored.
+    scale = (absmax / divisor).clamp(min=2.0 ** -24).half()
+    if not torch.isfinite(scale).all().item():
+        raise ValueError("quantization scale exceeds the finite fp16 range")
+    return scale.float()
+
+
+def _validate_dequant(packed: torch.Tensor, scales: torch.Tensor, group: int,
+                      *, int4: bool = False) -> None:
+    if type(group) is not int or group <= 0 or (int4 and group % 8):
+        raise ValueError("invalid quantization group")
+    if packed.ndim != 2 or packed.dtype != (torch.int32 if int4 else torch.int8):
+        raise ValueError("invalid packed tensor shape or dtype")
+    n, width = packed.shape
+    k = width * 8 if int4 else width
+    if k % group or tuple(scales.shape) != (n, k // group):
+        raise ValueError("scales shape must match packed rows and groups")
+    if scales.device != packed.device:
+        raise ValueError("packed values and scales must be on the same device")
 
 
 def quantize_int4(weight: torch.Tensor, group: int = 128) -> tuple[torch.Tensor, torch.Tensor]:
@@ -28,11 +76,13 @@ def quantize_int4(weight: torch.Tensor, group: int = 128) -> tuple[torch.Tensor,
       - group 64 instead of 128:               0.9730 -> 0.9724 (noise)
     So plain absmax per group stays until a Hessian-based (GPTQ-style) solver lands.
     """
+    _validate_weight(weight, group, int4=True)
     w = weight.detach().float()
     n, k = w.shape
-    assert k % group == 0 and group % 8 == 0, (k, group)
+    if k % group:
+        raise ValueError("input width must be divisible by group")
     wg = w.view(n, k // group, group)
-    scale = torch.clamp(wg.abs().amax(dim=2) / 8.0, min=1e-8)
+    scale = _stored_scale(wg.abs().amax(dim=2), 8.0)
     q = torch.round(wg / scale.unsqueeze(2)).clamp_(-8, 7).to(torch.int32) + 8
     q = q.view(n, k // 8, 8)
     packed = torch.zeros(n, k // 8, dtype=torch.int32, device=w.device)
@@ -43,6 +93,7 @@ def quantize_int4(weight: torch.Tensor, group: int = 128) -> tuple[torch.Tensor,
 
 def dequantize_int4(packed: torch.Tensor, scales: torch.Tensor, group: int = 128,
                     dtype: torch.dtype = torch.float16) -> torch.Tensor:
+    _validate_dequant(packed, scales, group, int4=True)
     n, k8 = packed.shape
     k = k8 * 8
     words = packed.view(n, k8, 1)
@@ -55,17 +106,20 @@ def dequantize_int4(packed: torch.Tensor, scales: torch.Tensor, group: int = 128
 
 
 def quantize_int8(weight: torch.Tensor, group: int = 128) -> tuple[torch.Tensor, torch.Tensor]:
+    _validate_weight(weight, group)
     w = weight.detach().float()
     n, k = w.shape
+    if k % group:
+        raise ValueError("input width must be divisible by group")
     wg = w.view(n, k // group, group)
-    scale = wg.abs().amax(dim=2) / 127.0
-    scale = torch.clamp(scale, min=1e-8)
+    scale = _stored_scale(wg.abs().amax(dim=2), 127.0)
     q = torch.round(wg / scale.unsqueeze(2)).clamp_(-127, 127).to(torch.int8)
     return q.view(n, k).contiguous(), scale.half().contiguous()
 
 
 def dequantize_int8(q: torch.Tensor, scales: torch.Tensor, group: int = 128,
                     dtype: torch.dtype = torch.float16) -> torch.Tensor:
+    _validate_dequant(q, scales, group)
     s = scales.to(dtype).repeat_interleave(group, dim=1)
     return (q.to(dtype) * s).to(dtype)
 
@@ -78,13 +132,11 @@ class QuantLinear:
     GEMV/GEMM serves all of them.
     """
 
-    __slots__ = ("packed", "scales", "bias", "n", "k", "group", "kind", "dtype",
-                 "scratch", "packed_tm")
+    __slots__ = ("packed", "scales", "bias", "n", "k", "group", "kind", "dtype", "scratch")
 
     def __init__(self, packed: torch.Tensor, scales: torch.Tensor | None, bias: torch.Tensor | None,
                  n: int, k: int, group: int, kind: str, dtype: torch.dtype = torch.float16):
         self.packed = packed
-        self.packed_tm = None
         self.scales = scales
         self.bias = bias
         self.n = n
@@ -98,9 +150,21 @@ class QuantLinear:
     def from_float(cls, weight: torch.Tensor, bias: torch.Tensor | None, kind: str = "int4",
                    group: int = 128, chunk: int = 8192) -> "QuantLinear":
         """Quantize row-chunked so a 3B vocab-wide lm_head fits on a small GPU."""
+        if kind not in ("int4", "int8", "fp16"):
+            raise ValueError(f"unknown quantization kind: {kind!r}")
+        _validate_weight(weight, group, int4=kind == "int4")
+        if type(chunk) is not int or chunk <= 0:
+            raise ValueError("chunk must be a positive integer")
         n, k = weight.shape
+        if bias is not None and (tuple(bias.shape) != (n,) or bias.device != weight.device
+                                 or not bias.is_floating_point() or not torch.isfinite(bias).all().item()
+                                 or (bias.abs() > torch.finfo(torch.float16).max).any().item()):
+            raise ValueError("bias must be finite, floating point, same-device, and have shape [N]")
         w = weight.detach()
-        if (kind not in ("int4", "int8")) or k % group != 0:
+        if kind == "fp16" or k % group != 0:
+            for part in _validation_chunks(w):
+                if (part.abs() > torch.finfo(torch.float16).max).any().item():
+                    raise ValueError("weight exceeds the finite fp16 range for dense fallback")
             return cls(w.half().contiguous(), None,
                        bias.half().contiguous() if bias is not None else None,
                        n, k, group, "fp16", dtype=torch.float16)
@@ -113,39 +177,8 @@ class QuantLinear:
         packed = torch.cat(packed_parts, dim=0).contiguous()
         scales = torch.cat(scale_parts, dim=0).contiguous()
         del packed_parts, scale_parts
-        out = cls(packed, scales, bias.half().contiguous() if bias is not None else None,
-                  n, k, group, kind, dtype=torch.float16)
-        import os as _os
-
-        # tile-major は 3B 以上で効く（0.5B/1.5B ではインデックス計算が勝って遅くなる）。
-        # 自動判定はせず、明示的に有効化してもらう（重みが 2 倍になるため）。
-        if kind == "int4" and _os.environ.get("KAZE_INT4_TM") == "1" and n * k >= (1 << 20):
-            out.make_tile_major_copy()
-        return out
-
-    def make_tile_major_copy(self) -> None:
-        """decode 用に [K/G, N, G/2] の複製を作る（2-D の重みは prefill 用に残す）。"""
-        if self.kind != "int4" or self.packed.dim() != 2:
-            return
-        # 空き VRAM が足りない層はあきらめる（部分的に効かせる。残りは従来経路）
-        try:
-            import torch as _t
-
-            free, _ = _t.cuda.mem_get_info()
-            if free < self.packed.numel() * 2 + (512 << 20):
-                return
-        except Exception:
-            pass
-        g = self.group
-        n, half = self.packed.shape
-        blocks = self.k // g
-        src = self.packed.view(torch.int8)
-        dst = src.new_empty((blocks, n, g // 2))
-        step = max(1, (1 << 22) // max(n * (g // 2), 1))
-        for b0 in range(0, blocks, step):
-            b1 = min(blocks, b0 + step)
-            dst[b0:b1] = src[:, b0 * (g // 2):b1 * (g // 2)].view(n, b1 - b0, g // 2).permute(1, 0, 2)
-        self.packed_tm = dst.contiguous()
+        return cls(packed, scales, bias.half().contiguous() if bias is not None else None,
+                   n, k, group, kind, dtype=torch.float16)
 
     @property
     def nbytes(self) -> int:
@@ -169,8 +202,13 @@ class QuantLinear:
 
 def concat_rows(layers: list[QuantLinear]) -> QuantLinear:
     """Fuse several same-K linears into one wide linear (qkv, gate+up)."""
+    if not layers:
+        raise ValueError("layers must not be empty")
+    if any(l.group != layers[0].group for l in layers):
+        raise ValueError("layers must have the same quantization group")
+    if any(l.k != layers[0].k or l.kind != layers[0].kind for l in layers):
+        raise ValueError("layers must have the same input width and kind")
     kinds = {l.kind for l in layers}
-    assert len(kinds) == 1, kinds
     kind = kinds.pop()
     k = layers[0].k
     packed = torch.cat([l.packed for l in layers], dim=0).contiguous()

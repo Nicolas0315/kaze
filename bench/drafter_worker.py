@@ -1,19 +1,17 @@
 """Measure one (task, config) pair in a fresh process: no GPU state carryover."""
 import json
-import os
 import sys
 import time
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, ".")
+sys.path.insert(0, "./bench")
 from transformers import AutoTokenizer
 
 from drafter_tasks import CONFIGS, TASKS
 from kaze.engine import Engine, SamplingParams
 from kaze.loader import load_model
 
-MODELS = os.environ.get("KAZE_MODELS", os.path.expanduser("~/models"))
-MODEL = os.path.join(MODELS, "Qwen2.5-0.5B-Instruct")
+MODEL = "/models/Qwen2.5-0.5B-Instruct"
 KIND = "int8"
 MAX_TOKENS = 96
 
