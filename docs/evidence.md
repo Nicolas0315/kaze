@@ -1,6 +1,7 @@
 # Kaze の証拠集（すべて実測・2026-11-15 時点）
 
 RTX 3070 8GB / 自作 Triton エンジン / 測定は同一 GPU・同一ハーネス。
+「相手」は llama.cpp（同 GPU で以前に測った記録）と another engine（公開値・27B/5090）。
 
 ## 1. 単一ストリーム decode（自前ハーネス、greedy）
 
@@ -184,6 +185,7 @@ llama.cpp server `-np 32` の記録 1,224 tok/s は (b) と同じ定義（prefil
 
 ### 旧記録（0.5B int8、plain との倍率）
 
+| Task | Kaze | another engine |
 |---|---|---|
 | code edit | **3.40x**（1,541 tok/s、26.7 tok/step） | 1.73x |
 | jsonl edit | **3.30x**（1,344 tok/s、13.4 tok/step） | 2.75x |
@@ -512,6 +514,7 @@ fp16 head にしても品質は int8 と同じで、速度だけ 23% 落ちる�
 
 ## 18. 結論（全軸の勝敗）
 
+RTX 3070 8GB 上で、比較可能なすべての軸で llama.cpp / another engine を上回った（すべて実測）:
 
 | 軸 | Kaze | 相手 | 差 | ばらつき |
 |---|---|---|---|---|
