@@ -13,10 +13,10 @@ Kaze は「batch=1 の decode も、長い prefill も、HBM 帯域の限界ま�
 - **llama.cpp との全指標対戦表は [docs/final_table.md](docs/final_table.md)**（単一 decode / prefill /
   32・64 本同時 / 4K×8 / 16K×4 の全セルで上回り、7B の高並列と長文脈は llama.cpp が起動できない領域）
 - 実測（RTX 3070 8GB、int4 本体＋int4 ヘッド・greedy・投機 OFF）:
-  **decode 0.5B 884 / 1.5B 360 / 3B 209 tok/s**、**prefill 0.5B 49.2k / 1.5B 16.8k / 3B 10.3k tok/s**
-  （`bench/compare.py`、64 トークン入力・512 トークン prefill、2026-11-16 再測定）、
+  **decode 0.5B 870.9 / 1.5B 334.9 / 3B 210.0 tok/s**、**prefill 0.5B 48.4k / 1.5B 18.6k / 3B 9.1k tok/s**
+  （`bench/compare.py`、128 トークン生成・512 トークン prefill、2026-11-16 再測定）、
   リクエスト全体（prefill 込み・32 本同時到着・プロンプト 32 tok・生成 64 tok）は
-  **0.5B 9,952 / 1.5B 5,155 / 3B 3,165 / 7B 1,698 tok/s**（64 本なら 0.5B 14,046 / 7B 2,146）。
+  **0.5B 9,170 / 1.5B 4,870 / 3B 3,009 / 7B 1,651 tok/s**（64 本なら 0.5B 14,046 / 7B 2,146）。
   ハーネスごとに条件が違う数字は混ぜません。比較は必ず [docs/final_table.md](docs/final_table.md) の
   同一条件の表を使ってください。
   長文は 0.5B int4 で 16K **508 tok/s**、**262K（`--factor 16`）までニードル recall 正解**。1.5B は 200K まで（262K は 8GB に載らず）
