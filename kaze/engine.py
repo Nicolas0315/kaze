@@ -337,8 +337,6 @@ class Engine:
         # 128K (index 8192 out of bounds for the block table)
         self.max_blocks_per_seq = blocks_for(self.max_model_len + block_size, block_size) + 2
 
-        if num_blocks is None:
-            num_blocks = self._blocks_from_memory(gpu_memory_utilization)
         _f16 = torch.float16
         # int8 KV was implemented and measured (KL 0.0225 vs fp16, same speed, 2x
         # capacity) but it breaks long-range needle recall (40K: "10" vs "7429") and
@@ -363,6 +361,12 @@ class Engine:
                 f"({self.backend.vendor}) does not support; falling back to fp16",
                 stacklevel=2)
         _kd, _vd = _kinds.get(self.cache_dtype, (_f16, _f16))
+        # remember the element widths: the pool is sized before KVCache exists, so this is
+        # the only place that knows that an fp8 half costs one byte instead of two
+        self._kv_itemsize = (torch.empty((), dtype=_kd).element_size()
+                             + torch.empty((), dtype=_vd).element_size())
+        if num_blocks is None:
+            num_blocks = self._blocks_from_memory(gpu_memory_utilization)
         if self.cache_dtype == "fp8":
             # quantising the keys costs long-range recall: measured 2026-11-16 on 0.5B int4,
             # needle-in-a-haystack MISSes at both 4K and 16K ("The passkey is 739" instead of
@@ -466,7 +470,10 @@ class Engine:
         return max(8, usable // self.cache_bytes_per_block())
 
     def cache_bytes_per_block(self) -> int:
-        return 2 * self.cfg.num_hidden_layers * self.block_size * self.cfg.kv_size * 2
+        # bytes for one block, K and V together, at the widths chosen for this run.
+        # Hardcoding 2 bytes for both halves used to ignore the fp8 saving entirely.
+        itemsize = getattr(self, "_kv_itemsize", 4)
+        return self.cfg.num_hidden_layers * self.block_size * self.cfg.kv_size * itemsize
 
     def _hash(self, parent: int, tokens: list[int]) -> int:
         return hash((parent, tuple(tokens)))

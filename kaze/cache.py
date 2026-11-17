@@ -142,7 +142,15 @@ class KVCache:
         return self.allocator.used
 
     def bytes_per_block(self) -> int:
-        return 2 * self.cfg.num_hidden_layers * self.block_size * self.cfg.kv_size * 2
+        # size from the actual dtypes: fp8v keeps K in fp16 and V in fp8, so the same
+        # memory holds 25% more tokens than an fp16 pool.  The engine derives the block
+        # count from this number, so hardcoding 2 bytes per element left that capacity
+        # unused (an external review measured "fp8v does not raise the KV token count,
+        # VRAM is just left over").
+        kb = self.k.element_size()
+        vb = self.v.element_size()
+        return (self.cfg.num_hidden_layers * self.block_size * self.cfg.kv_size
+                * (kb + vb))
 
     # --------------------------------------------------------------- per seq
     def slots(self, blocks: list[int], start: int, end: int) -> torch.Tensor:
