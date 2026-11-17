@@ -9,6 +9,9 @@ from typing import Iterator
 import torch
 from safetensors import safe_open
 
+# read() caps a single call at 2 GiB on Linux; stay well under it
+_READ_CHUNK = 1 << 30  # 1 GiB
+
 from kaze.config import ModelConfig
 from kaze.gguf import GGUFWeights, resolve_gguf
 from kaze.model import KazeModel, LayerWeights
@@ -103,9 +106,24 @@ class _Reader:
                 continue
             a, b = info["data_offsets"]
             dtype = ST_DTYPES[info["dtype"]]
+            n = b - a
             with open(f, "rb", buffering=0) as fh:
                 fh.seek(base + a)
-                buf = fh.read(b - a)
+                # Linux read() returns at most 2 GiB per call, so a single read() on a
+                # larger tensor comes back short and looked like a truncated file
+                # (27B embeddings, 2.54 GB).  Read in windows instead.
+                if n <= _READ_CHUNK:
+                    buf = fh.read(n)
+                else:
+                    parts = []
+                    left = n
+                    while left:
+                        piece = fh.read(min(_READ_CHUNK, left))
+                        if not piece:
+                            break
+                        parts.append(piece)
+                        left -= len(piece)
+                    buf = b"".join(parts)
             if len(buf) != b - a:
                 raise IOError(f"{name}: short read from {f} ({len(buf)} of {b - a} bytes); "
                               f"the file is truncated - re-download it")

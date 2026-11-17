@@ -1633,28 +1633,49 @@ class Engine:
             for mode in ("short", "long"):
                 if (tdim, mode) in self.graphs:
                     continue
-                st = self._static(tdim)
-                bufs = self.model.get_buffers(tdim)
-                torch.cuda.synchronize()
-                side = torch.cuda.Stream()
-                side.wait_stream(torch.cuda.current_stream())
-                with torch.cuda.stream(side):
-                    for _ in range(2):
-                        self.model.decode_logits(st["ids"], st["positions"], st["slots"],
-                                                 st["block_tables"], st["seq_lens"],
-                                                 self.cache, tdim=tdim, bufs=bufs,
-                                                 attn_mode=mode)
-                torch.cuda.current_stream().wait_stream(side)
-                torch.cuda.synchronize()
-                g = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(g):
-                    self.model.decode_logits(st["ids"], st["positions"], st["slots"],
-                                             st["block_tables"], st["seq_lens"],
-                                             self.cache, tdim=tdim, bufs=bufs,
-                                             attn_mode=mode)
-                self.graphs[(tdim, mode)] = g
-                g.replay()
+                try:
+                    self._capture_one(tdim, mode)
+                except RuntimeError as exc:
+                    msg = str(exc)
+                    if "shared memory" not in msg and "out of resource" not in msg.lower():
+                        raise
+                    # A tile for this bucket does not fit in shared memory on this GPU
+                    # (reported on 7B/14B/32B int8 with max_batch=128: 147,968 needed vs
+                    # 101,376 available).  Losing the graph costs throughput but keeps the
+                    # engine usable, and it says which knob to turn.
+                    import warnings
+                    warnings.warn(
+                        f"cannot capture the decode graph for {tdim} rows ({mode} "
+                        f"attention): {msg.splitlines()[0]} -- continuing without CUDA "
+                        f"graphs. Lower --max-batch (the row bucket is the cost) or run "
+                        f"--no-cuda-graph.", stacklevel=2)
+                    self.use_cuda_graph = False
+                    self.graphs.clear()
+                    return
         torch.cuda.synchronize()
+
+    def _capture_one(self, tdim: int, mode: str) -> None:
+        st = self._static(tdim)
+        bufs = self.model.get_buffers(tdim)
+        torch.cuda.synchronize()
+        side = torch.cuda.Stream()
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            for _ in range(2):
+                self.model.decode_logits(st["ids"], st["positions"], st["slots"],
+                                         st["block_tables"], st["seq_lens"],
+                                         self.cache, tdim=tdim, bufs=bufs,
+                                         attn_mode=mode)
+        torch.cuda.current_stream().wait_stream(side)
+        torch.cuda.synchronize()
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            self.model.decode_logits(st["ids"], st["positions"], st["slots"],
+                                     st["block_tables"], st["seq_lens"],
+                                     self.cache, tdim=tdim, bufs=bufs,
+                                     attn_mode=mode)
+        self.graphs[(tdim, mode)] = g
+        g.replay()
 
     # --------------------------------------------------------------- driving
     def is_idle(self) -> bool:
