@@ -272,6 +272,16 @@ class Sequence:
         return len(self.prompt) + len(self.output)
 
 
+def _pad_rows_fill(h_rows: torch.Tensor, h_lens: torch.Tensor, n_real: int) -> None:
+    """Stage row 0 into the padding rows of a bucket (host side, pinned tensors).
+
+    The decode step duplicates row 0 into every row past n_real instead of zeroing it; see
+    the fill site in _decode_step for why zeroed padding corrupted the KV cache.
+    """
+    h_rows[:, n_real:] = h_rows[:, :1]
+    h_lens[n_real:] = h_lens[0]
+
+
 class Engine:
     def __init__(self, model: KazeModel, *, block_size: int = 16, max_batch: int = 32,
                  max_model_len: int | None = None, max_batched_tokens: int = 2048,
@@ -449,6 +459,14 @@ class Engine:
         # 32 measured best on a 32-request burst (cap 4/8/16/32 -> 0.114/0.074/0.059/0.042 s);
         # the row count stays bounded by batched_prefill_chunk and the step budget
         self.batched_prefill_max = int(os.environ.get("KAZE_BATCHED_PREFILL_MAX", "32"))
+        # Optional reproducibility mode (see set_deterministic): pins decode to one row
+        # bucket so a sequence decoded alone and the same sequence decoded inside a batch run
+        # the same kernels.  Off by default -- the per-bucket kernels are tuned for speed and
+        # the row count is part of the tuning (see kaze/kernels/quant_linear.py:_cfg).
+        self.deterministic = False
+        self._det_saved: tuple | None = None
+        if os.environ.get("KAZE_DETERMINISTIC", "0") == "1":
+            self.set_deterministic(True)
         self.batched_prefill_chunk = 1024
         self.attn_block_n = 128          # 256 measured neutral, kept as a knob
         self._spec_probe = 0
@@ -477,6 +495,47 @@ class Engine:
 
     def _hash(self, parent: int, tokens: list[int]) -> int:
         return hash((parent, tuple(tokens)))
+
+    def set_deterministic(self, flag: bool = True) -> None:
+        """Pin decode to a single row bucket so solo and batched decode agree bit for bit.
+
+        The bucket (1, 16, 32, ...) is not just a padded row count: it selects the TDIM
+        constexpr of every decode kernel *and* which kernel family runs.  At TDIM=1 the GEMV
+        is a matvec with fp16 activations; at TDIM>=16 the same call is a tl.dot, the GEMV
+        config table switches to the 16-row family, and the gate_up projection quantises its
+        activations to int8 (W8A8_SWIGLU_DECODE).  So batch 1 and batch 4 are different
+        arithmetic, not one arithmetic evaluated in a different order, and a greedy decode
+        can leave the batch-1 path after a few dozen tokens.
+
+        Pinning one bucket for every batch size makes the kernels identical, which makes the
+        tokens identical (measured: bit equal).  The cost is that a single stream pays the
+        bucket's row count, so measure before turning it on.
+
+        Clear and recapture CUDA graphs after calling this if the engine is already running.
+        """
+        flag = bool(flag)
+        if flag == self.deterministic:
+            return
+        if flag:
+            self._det_saved = (list(self.buckets), self.batched_prefill, self.speculative)
+            cap = 16
+            while cap < self.max_batch:
+                cap *= 2
+            self.buckets = [cap]
+            # a batched prefill forward changes the activation rows of the prompt, and
+            # speculation verifies several rows at once: both would reintroduce the
+            # shape-dependent arithmetic this mode exists to remove
+            self.batched_prefill = False
+            self.speculative = False
+        else:
+            buckets, bp, sp = self._det_saved or ([], True, False)
+            if buckets:
+                self.buckets = buckets
+            self.batched_prefill = bp
+            self.speculative = sp
+            self._det_saved = None
+        self.deterministic = flag
+        self.graphs.clear()
 
     # ------------------------------------------------------------- scheduling
     def add_request(self, prompt: list[int] | torch.Tensor, params: SamplingParams | None = None,
@@ -1245,8 +1304,7 @@ class Engine:
                     bt[0].copy_(st["h_bt"][0], non_blocking=True)
                     st["bt_key"] = key
                 if n_real < tdim:
-                    h_rows[:, n_real:].zero_()
-                    st["h_lens"][n_real:] = 1
+                    _pad_rows_fill(h_rows, st["h_lens"], n_real)
             else:
                 h_rows[0, :n_real] = torch.tensor(id_l, dtype=torch.long)
                 h_rows[1, :n_real] = torch.tensor(pos_l, dtype=torch.long)
@@ -1256,9 +1314,7 @@ class Engine:
                 st["h_bt"][:n_real] = torch.stack([s.bt_cpu for s in use])
                 bt[:n_real].copy_(st["h_bt"][:n_real], non_blocking=True)
                 if n_real < tdim:
-                    h_rows[:, n_real:].zero_()
-                    st["h_lens"][n_real:] = 1
-                    bt[n_real:].zero_()
+                    _pad_rows_fill(h_rows, st["h_lens"], n_real)
             rows4.copy_(h_rows, non_blocking=True)
             lens.copy_(st["h_lens"], non_blocking=True)
         else:
@@ -1270,11 +1326,18 @@ class Engine:
                                              dtype=torch.int32, device=dev))
             bt[:n_real].copy_(torch.stack([s.bt for s in use]))
         if n_real < tdim:
-            ids[n_real:].zero_()
-            pos[n_real:].zero_()
-            slots[n_real:].zero_()
-            lens[n_real:].fill_(1)
-            bt[n_real:].zero_()
+            # Padding rows duplicate row 0 rather than being zeroed.  Zeroed padding used to
+            # be pointed at slot 0 / block table 0, and the block allocator hands out block 0
+            # first, so every decode step of a partially filled bucket wrote the padding rows'
+            # K/V over a live sequence's first token -- in all 24 layers, for every step.
+            # Copies of row 0 store byte-identical K/V into row 0's own slot, so the padding
+            # becomes a no-op instead of a silent corruption (bench/repro_b10_logits.py: the
+            # batch-vs-solo logit gap of row 0 depended on which row owned block 0).
+            ids[n_real:].copy_(ids[:1].expand(tdim - n_real))
+            pos[n_real:].copy_(pos[:1].expand(tdim - n_real))
+            slots[n_real:].copy_(slots[:1].expand(tdim - n_real))
+            lens[n_real:].copy_(lens[:1].expand(tdim - n_real))
+            bt[n_real:].copy_(bt[:1].expand(tdim - n_real, -1))
         max_len = max((s.num_computed for s in seqs), default=1)
         # The split-K path wins from ~256 tokens up (0.5B int4, same process: ctx 256 794
         # vs 748, 512 821 vs 698, 1024 787 vs 597, 2048 749 vs 453 tok/s), so the old
