@@ -4,7 +4,6 @@ from __future__ import annotations
 import gc
 import json
 import os
-from typing import Iterator
 
 import torch
 from safetensors import safe_open

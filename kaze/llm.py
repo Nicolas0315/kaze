@@ -9,15 +9,12 @@ from __future__ import annotations
 import queue
 import threading
 import time
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 from typing import Iterator
 
-import torch
 
-from kaze.config import ModelConfig
 from kaze.engine import Engine, RequestOutput
 from kaze.loader import load_model
-from kaze.model import KazeModel
 from kaze.sampler import SamplingParams
 from kaze.text import decode_output
 
