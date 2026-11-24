@@ -6,7 +6,6 @@ one real GGUF file when bench/llamacpp/models has one.
 """
 from __future__ import annotations
 
-import os
 import struct
 import sys
 import tempfile
@@ -17,8 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import torch
 
-from kaze.config import ModelConfig
-from kaze.gguf import (GGML_TYPES, GGUFReader, GGUFWeights, config_from_gguf,
+from kaze.gguf import (GGUFReader, GGUFWeights, config_from_gguf,
                        dequantize_blocks, resolve_gguf, unpermute_qk)
 from kaze.loader import load_model
 
