@@ -6,8 +6,7 @@ graph of N launches with CUDA events instead, which is stable to <1%.
 import os, sys, statistics
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import torch
-from kaze.kernels.quant_linear import (gemv_int4_splitk_kernel, gemv_int4_kernel,
-                                       gemv_epilogue_kernel)
+from kaze.kernels.quant_linear import (gemv_int4_splitk_kernel, gemv_epilogue_kernel)
 
 torch.manual_seed(0)
 dev = "cuda"

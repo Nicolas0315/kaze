@@ -9,7 +9,6 @@ import torch
 sys.path.insert(0, ".")
 
 from kaze.cache import KVCache
-from kaze.config import ModelConfig
 from kaze.engine import Engine, SamplingParams
 from kaze.kernels import attn as K_attn
 from kaze.kernels import quant_linear as K_lin
@@ -308,7 +307,6 @@ def _() -> None:
 @check("kernel.fused_rope_attention_matches")
 def _() -> None:
     """The fused rope+attention kernel must reproduce rope_scatter + attn_decode exactly."""
-    import kaze.model as M
     from kaze.cache import KVCache
     from kaze.kernels import attn as A
     from kaze.kernels.fused import rope_scatter
@@ -664,17 +662,5 @@ def test_moe_weight_bytes() -> None:
     assert n < 4 * 1024 ** 3, n
 
 
-
 if __name__ == "__main__":
     sys.exit(main())
-
-
-@check("moe.weight_bytes")
-def test_moe_weight_bytes() -> None:
-    """bookkeeping must not assume a dense MLP (MoE keeps experts stacked)"""
-    model = _moe_model()
-    if model is None:
-        return
-    n = model.weight_bytes()
-    assert n > 0, n
-    assert n < 4 * 1024 ** 3, n

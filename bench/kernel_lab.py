@@ -18,7 +18,6 @@ Examples:
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import sys
 import time
@@ -322,9 +321,7 @@ def triton_cdiv(a: int, b: int) -> int:
 # ------------------------------------------------------------------------ attn
 def do_attn(args) -> None:
     from kaze.config import ModelConfig
-    from kaze.cache import KVCache
     cfg = ModelConfig.from_pretrained(args.model)
-    from kaze.cache import KVCache as _C
     print("attn mode needs a built model; use profile mode for attention share")
     print("shapes:", cfg.hidden_size, cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim)
 

@@ -19,7 +19,7 @@ import re
 import threading
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from numbers import Integral
 from typing import Callable, Iterable
 
@@ -1015,7 +1015,6 @@ class Engine:
             for x in scratch:
                 alloc.release(x)
             return False
-        layers = self.cfg.num_hidden_layers
         try:
             if off:
                 src = self.cache.k[:, real, :off]

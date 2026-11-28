@@ -291,11 +291,9 @@ class KazeModel:
         seq_len = q_start + ids.shape[0]
         slots_new = cache.slots_of(block_table, q_start, seq_len)
         cfg = self.cfg
-        device = self.device
         hidden = self.embed.index_select(0, ids)                  # [P, H]
         hq, hkv, d = cfg.num_attention_heads, cfg.num_key_value_heads, self.head_dim
         qs = hq * d
-        kvs = hkv * d
         p = ids.shape[0]
         new_slots = slots_new
 
@@ -435,7 +433,6 @@ class KazeModel:
             bufs = self.get_buffers(tdim or 16)
         tdim = tdim or bufs.tdim
         hq, hkv, d = cfg.num_attention_heads, cfg.num_key_value_heads, self.head_dim
-        qs, kvs = hq * d, hkv * d
         inter = cfg.intermediate_size
         k_flat_all = cache.k_flat
         v_flat_all = cache.v_flat
@@ -626,7 +623,7 @@ class KazeModel:
         cfg = self.cfg
         n = ids.shape[0] if n_real is None else n_real
         hq, hkv, d = cfg.num_attention_heads, cfg.num_key_value_heads, self.head_dim
-        qs, kvs, inter = hq * d, hkv * d, cfg.intermediate_size
+        qs, inter = hq * d, cfg.intermediate_size
         bufs = self.get_buffers(tdim)
         q8 = False          # verification always runs the fp16-activation path
         hidden = bufs.hidden
@@ -764,7 +761,6 @@ class DenseReference:
         cfg = model.cfg
         self.cfg = cfg
         self.dtype = dtype
-        dev = model.device
         self.embed = model.embed.to(dtype)
         self.layers = []
         for l in model.layers:

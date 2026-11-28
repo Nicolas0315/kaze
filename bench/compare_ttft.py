@@ -6,7 +6,7 @@
 変えないと 2 回目以降が実質 8 トークンだけの処理になり、比較になりません。
 このスクリプトは先頭 8 文字を差し替えてキャッシュを避けています。
 """
-import json, os, subprocess, sys, time
+import os, sys, time
 sys.path.insert(0, "/data/File/Prog/kaze")
 os.environ.setdefault("KAZE_MODELS", "/models")
 PROMPT_LEN = 512

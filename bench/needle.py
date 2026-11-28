@@ -12,7 +12,6 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import torch
 
 
 FILLER = [
@@ -57,7 +56,7 @@ def main() -> None:
     if args.factor:
         # YaRN has to be in the config BEFORE the rope tables are built, so point the
         # loader at a temp dir with symlinks + a patched config.json
-        import json, shutil, tempfile
+        import json, tempfile
         src = os.path.abspath(args.model.rstrip("/"))
         tmp = tempfile.mkdtemp(prefix="kaze-yarn")
         for f in os.listdir(src):

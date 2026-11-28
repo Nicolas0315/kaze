@@ -1,5 +1,5 @@
 """Speculative decode through the HTTP server (single stream, repetitive prompt)."""
-import json, sys, time
+import sys, time
 import requests
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8099
 GEN = int(sys.argv[2]) if len(sys.argv) > 2 else 128
